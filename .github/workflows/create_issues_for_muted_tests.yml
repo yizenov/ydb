@@ -100,16 +100,64 @@ jobs:
             BASE_BRANCH="${{ github.event.pull_request.base.ref || 'main' }}"
           fi
           
-          python3 .github/scripts/tests/process_muted_tests_after_merge.py get-muted-file \
+          python3 .github/scripts/tests/mute_utils/process_muted_tests_after_merge.py get-muted-file \
             --merge_commit_sha="${MERGE_SHA}" \
             --base_branch="${BASE_BRANCH}" \
             --output="muted_ya.txt"
           echo "muted_ya_file=muted_ya.txt" >> $GITHUB_OUTPUT
           echo "base_branch=${BASE_BRANCH}" >> $GITHUB_OUTPUT
-          echo "is_main=$([ \"${BASE_BRANCH}\" == \"main\" ] && echo \"true\" || echo \"false\")" >> $GITHUB_OUTPUT
+
+      - name: Check config for issues and alerts
+        id: check_config
+        run: |
+          BASE_BRANCH="${{ steps.get_file.outputs.base_branch }}"
+          BUILD_TYPE="${{ env.BUILD_TYPE }}"
+          
+          SHOULD_CREATE_ISSUES=$(python3 .github/scripts/tests/mute_utils/check_config.py "$BASE_BRANCH" "$BUILD_TYPE" issues)
+          SHOULD_SEND_ALERTS=$(python3 .github/scripts/tests/mute_utils/check_config.py "$BASE_BRANCH" "$BUILD_TYPE" alerts)
+          
+          echo "should_create_issues=${SHOULD_CREATE_ISSUES}" >> $GITHUB_OUTPUT
+          echo "should_send_alerts=${SHOULD_SEND_ALERTS}" >> $GITHUB_OUTPUT
+
+      - name: Get old muted_ya.txt from base branch
+        id: get_old_file
+        run: |
+          BASE_BRANCH="${{ steps.get_file.outputs.base_branch }}"
+          # Get the commit before merge (parent of merge commit)
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            MERGE_SHA="${{ steps.get_pr_details.outputs.merge_commit_sha }}"
+            if [ -n "$MERGE_SHA" ]; then
+              # Get parent commit (before merge)
+              OLD_SHA=$(git rev-parse ${MERGE_SHA}^1 2>/dev/null || echo "")
+            else
+              # Fallback: get from base branch HEAD~1
+              OLD_SHA="origin/${BASE_BRANCH}~1"
+            fi
+          else
+            MERGE_SHA="${{ github.event.pull_request.merge_commit_sha || '' }}"
+            if [ -n "$MERGE_SHA" ]; then
+              OLD_SHA=$(git rev-parse ${MERGE_SHA}^1 2>/dev/null || echo "")
+            else
+              OLD_SHA="origin/${BASE_BRANCH}~1"
+            fi
+          fi
+          
+          # Try to get old file
+          if [ -n "$OLD_SHA" ]; then
+            python3 .github/scripts/tests/mute_utils/process_muted_tests_after_merge.py get-muted-file \
+              --merge_commit_sha="${OLD_SHA}" \
+              --base_branch="${BASE_BRANCH}" \
+              --output="old_muted_ya.txt" || touch old_muted_ya.txt
+          else
+            touch old_muted_ya.txt
+          fi
+          
+          if [ -f old_muted_ya.txt ] && [ -s old_muted_ya.txt ]; then
+            echo "old_file=old_muted_ya.txt" >> $GITHUB_OUTPUT
+          fi
 
       - name: DEBUG: Stop before create_issues
-        if: steps.get_file.outputs.is_main == 'true'
+        if: steps.check_config.outputs.should_create_issues == 'true'
         run: |
           echo "DEBUG: Stopping before create_issues step"
           echo "muted_ya.txt content preview:"
@@ -117,32 +165,69 @@ jobs:
           exit 1
 
       - name: Create issues for muted tests
-        if: steps.get_file.outputs.is_main == 'true'
+        if: steps.check_config.outputs.should_create_issues == 'true'
         id: create_issues
         env:
           GITHUB_TOKEN: ${{ secrets.YDBOT_TOKEN }}
         run: |
-          python3 .github/scripts/tests/create_new_muted_ya.py create_issues \
-            --file_path=muted_ya.txt \
-            --branch=${{ steps.get_file.outputs.base_branch }}
+          OLD_FILE="${{ steps.get_old_file.outputs.old_file || '' }}"
+          if [ -n "$OLD_FILE" ] && [ -f "$OLD_FILE" ]; then
+            python3 .github/scripts/tests/mute_utils/create_new_muted_ya.py create_issues \
+              --file_path=muted_ya.txt \
+              --old_muted_ya_path="$OLD_FILE" \
+              --branch=${{ steps.get_file.outputs.base_branch }} \
+              --build_type=${{ env.BUILD_TYPE }}
+          else
+            python3 .github/scripts/tests/mute_utils/create_new_muted_ya.py create_issues \
+              --file_path=muted_ya.txt \
+              --branch=${{ steps.get_file.outputs.base_branch }} \
+              --build_type=${{ env.BUILD_TYPE }}
+          fi
           # Script creates created_issues.txt and saves path in GITHUB_OUTPUT
           if [ -f created_issues.txt ]; then
             echo "issues_file=created_issues.txt" >> $GITHUB_OUTPUT
           fi
       
-      - name: Send Telegram notifications
-        if: steps.get_file.outputs.is_main == 'true' && steps.create_issues.outputs.issues_file != ''
+      - name: Prepare team notifications for stable branches
+        if: steps.check_config.outputs.should_send_alerts == 'true' && steps.check_config.outputs.should_create_issues != 'true'
+        id: prepare_notifications
+        run: |
+          OLD_FILE="${{ steps.get_old_file.outputs.old_file || '' }}"
+          if [ -n "$OLD_FILE" ] && [ -f "$OLD_FILE" ]; then
+            python3 .github/scripts/tests/mute_utils/create_new_muted_ya.py prepare_team_notifications \
+              --new_muted_ya_path=muted_ya.txt \
+              --old_muted_ya_path="$OLD_FILE" \
+              --branch=${{ steps.get_file.outputs.base_branch }} \
+              --build_type=${{ env.BUILD_TYPE }}
+          else
+            python3 .github/scripts/tests/mute_utils/create_new_muted_ya.py prepare_team_notifications \
+              --new_muted_ya_path=muted_ya.txt \
+              --branch=${{ steps.get_file.outputs.base_branch }} \
+              --build_type=${{ env.BUILD_TYPE }}
+          fi
+          if [ -f created_issues.txt ]; then
+            echo "issues_file=created_issues.txt" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Send Telegram notifications or queue for aggregation
+        if: steps.check_config.outputs.should_send_alerts == 'true' && (steps.create_issues.outputs.issues_file != '' || steps.prepare_notifications.outputs.issues_file != '')
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_YDBOT_TOKEN }}
           TEAM_CHANNELS: ${{ vars.TG_TEAM_CHANNELS }}
+          BASE_BRANCH: ${{ steps.get_file.outputs.base_branch }}
+          BUILD_TYPE: ${{ env.BUILD_TYPE }}
+          CI_YDB_SERVICE_ACCOUNT_KEY_FILE_CREDENTIALS: ${{ secrets.CI_YDB_SERVICE_ACCOUNT_KEY_FILE_CREDENTIALS }}
         run: |
+          ISSUES_FILE="${{ steps.create_issues.outputs.issues_file || steps.prepare_notifications.outputs.issues_file }}"
           python3 .github/scripts/telegram/parse_and_send_team_issues.py \
             --on-mute-change-update \
-            --file "created_issues.txt" \
+            --file "$ISSUES_FILE" \
             --bot-token "$TELEGRAM_BOT_TOKEN" \
             --team-channels "$TEAM_CHANNELS" \
             --include-plots \
-            --delay 2
+            --delay 2 \
+            --branch "$BASE_BRANCH" \
+            --build-type "$BUILD_TYPE"
       
       - name: Comment PR
         env:
@@ -157,7 +242,7 @@ jobs:
             PR_NUMBER="${{ github.event.pull_request.number }}"
           fi
           
-          python3 .github/scripts/tests/process_muted_tests_after_merge.py comment-pr \
+          python3 .github/scripts/tests/mute_utils/process_muted_tests_after_merge.py comment-pr \
             --pr_number="${PR_NUMBER}" \
             --base_branch="${{ steps.get_file.outputs.base_branch }}" \
             --issues_file="${{ steps.create_issues.outputs.issues_file || '' }}"

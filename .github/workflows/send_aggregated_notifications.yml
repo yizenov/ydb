@@ -1,0 +1,49 @@
+name: Send Aggregated Notifications
+
+on:
+  schedule:
+    # Every 2 hours
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GH_TOKEN: ${{ secrets.YDBOT_TOKEN }}
+
+jobs:
+  send-aggregated-notifications:
+    name: Send aggregated Telegram notifications
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          
+      - name: Setup ydb access
+        uses: ./.github/actions/setup_ci_ydb_service_account_key_file_credentials
+        with:
+          ci_ydb_service_account_key_file_credentials: ${{ secrets.CI_YDB_SERVICE_ACCOUNT_KEY_FILE_CREDENTIALS }}
+          
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install ydb[yc] requests matplotlib numpy
+          
+      - name: Send aggregated notifications
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_YDBOT_TOKEN }}
+          TEAM_CHANNELS: ${{ vars.TG_TEAM_CHANNELS }}
+          CI_YDB_SERVICE_ACCOUNT_KEY_FILE_CREDENTIALS: ${{ secrets.CI_YDB_SERVICE_ACCOUNT_KEY_FILE_CREDENTIALS }}
+        run: |
+          python3 .github/scripts/telegram/parse_and_send_team_issues.py \
+            --send-aggregated \
+            --bot-token "$TELEGRAM_BOT_TOKEN" \
+            --team-channels "$TEAM_CHANNELS" \
+            --include-plots \
+            --delay 2
+

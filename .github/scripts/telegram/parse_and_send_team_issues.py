@@ -18,6 +18,15 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from send_telegram_message import send_telegram_message
 
+# Import notification storage if available
+try:
+    sys.path.insert(0, os.path.dirname(__file__))
+    from notification_storage import store_notification, get_pending_notifications, delete_notifications
+    NOTIFICATION_STORAGE_AVAILABLE = True
+except ImportError:
+    NOTIFICATION_STORAGE_AVAILABLE = False
+    print("⚠️ Notification storage not available")
+
 try:
     import ydb
     YDB_AVAILABLE = True
@@ -497,12 +506,13 @@ def create_trend_plot(team_name, trend_data, debug_dir=None, period=None):
 def parse_team_issues(content):
     """
     Parse team issues from the formatted results.
+    Now also supports format without issues (just test names).
     
     Args:
         content (str): Formatted results content
         
     Returns:
-        dict: Dictionary with team names as keys and their issues as values
+        dict: Dictionary with team names as keys and their issues/tests as values
     """
     teams = {}
     current_team = None
@@ -522,10 +532,10 @@ def parse_team_issues(content):
             # Start new team
             current_team = line.replace('👥 **TEAM** @ydb-platform/', '').strip()
             current_issues = []
-            
+        
         # Check for issue line
         elif line.startswith('🎯 ') and current_team:
-            # Extract issue URL and title
+            # Try to match issue URL format first
             issue_match = re.match(r'🎯 (https://github\.com/[^\s]+) - `([^`]+)`', line)
             if issue_match:
                 issue_url = issue_match.group(1)
@@ -534,6 +544,15 @@ def parse_team_issues(content):
                     'url': issue_url,
                     'title': issue_title
                 })
+            else:
+                # Match test name format (without URL) - for stable branches
+                test_match = re.match(r'🎯 `([^`]+)`', line)
+                if test_match:
+                    test_name = test_match.group(1)
+                    current_issues.append({
+                        'url': None,  # No issue URL
+                        'title': f"Mute {test_name}"  # Format similar to issue title
+                    })
     
     # Save last team
     if current_team and current_issues:
@@ -544,16 +563,18 @@ def parse_team_issues(content):
 
 
 
-def format_team_message(team_name, issues, team_responsible=None, muted_stats=None, show_diff=False):
+def format_team_message(team_name, issues, team_responsible=None, muted_stats=None, show_diff=False, branch='main'):
     """
     Format message for a specific team.
+    Now supports both issues (for main) and test names without issues (for stable branches).
     
     Args:
         team_name (str): Team name
-        issues (list): List of issues for the team
+        issues (list): List of issues/tests for the team (can be empty for stable branches)
         team_responsible (dict): Dictionary mapping team names to responsible usernames
         muted_stats (dict): Dictionary with team names as keys and {'total': count, 'today': count} as values
         show_diff (bool): Whether to show +/- statistics
+        branch (str): Branch name (for message title)
         
     Returns:
         str: Formatted message
@@ -564,25 +585,40 @@ def format_team_message(team_name, issues, team_responsible=None, muted_stats=No
     # Get current date in DD-MM-YY format
     current_date = datetime.now().strftime("%d-%m-%y")
     
-    # Start with title and team tag (replace - with _ in tag)
+    # Start with title and team tag
     team_tag = team_name.replace('-', '')
-    # Create team URL and escape it
     team_url = f"{GITHUB_ORG_TEAMS_URL}/{team_name}"
-    message = f"🔇 *{current_date} new muted tests in `main` for [{team_name}]({team_url})* #{team_tag}\n\n"
     
-    for issue in issues:
-        # Extract issue number from URL for compact display
-        issue_number = issue['url'].split('/')[-1] if '/' in issue['url'] else issue['url']
+    # Check if we have issues with URLs (main branch) or just test names (stable branches)
+    has_issue_urls = any(issue.get('url') for issue in issues)
+    
+    if has_issue_urls:
+        # Standard format with issues
+        message = f"🔇 *{current_date} new muted tests in `{branch}` for [{team_name}]({team_url})* #{team_tag}\n\n"
         
-        # Remove "in main" from title if present and "Mute " prefix
-        title = issue['title']
-        if title.endswith(' in main'):
-            title = title[:-8]  # Remove " in main"
-        if title.startswith('Mute '):
-            title = title[5:]  # Remove "Mute " prefix
+        for issue in issues:
+            if issue.get('url'):
+                # Extract issue number from URL for compact display
+                issue_number = issue['url'].split('/')[-1] if '/' in issue['url'] else issue['url']
+                
+                # Remove "in main" from title if present and "Mute " prefix
+                title = issue['title']
+                if title.endswith(f' in {branch}'):
+                    title = title[:-len(f' in {branch}')]
+                if title.startswith('Mute '):
+                    title = title[5:]  # Remove "Mute " prefix
+                
+                message += f" 🎯 `{title}` [#{issue_number}]({issue['url']})\n"
+    else:
+        # Format for stable branches (no issues, just test names)
+        message = f"🔇 *{current_date} new muted tests in `{branch}` for [{team_name}]({team_url})* #{team_tag}\n\n"
         
-        # Wrap title in backticks (will be escaped later with the whole message)
-        message += f" 🎯 `{title}` [#{issue_number}]({issue['url']})\n"
+        for issue in issues:
+            # Extract test name from title (remove "Mute " prefix if present)
+            test_name = issue['title']
+            if test_name.startswith('Mute '):
+                test_name = test_name[5:]
+            message += f" 🎯 `{test_name}`\n"
     
     # Add muted tests statistics for this specific team if available (moved to end)
     if muted_stats and team_name in muted_stats:
@@ -625,17 +661,18 @@ def format_team_message(team_name, issues, team_responsible=None, muted_stats=No
 
 def get_team_config(team_name, team_channels):
     """
-    Get configuration for a team (responsible users and channel).
+    Get configuration for a team (responsible users, channel, notification settings).
     
     Args:
         team_name (str): Team name
         team_channels (dict): Team channels configuration
         
     Returns:
-        tuple: (team_responsible, team_chat_id, team_thread_id) or (None, None, None) if not found
+        tuple: (team_responsible, team_chat_id, team_thread_id, notification_mode, notification_schedule, build_types) 
+               or (None, None, None, None, None, None) if not found
     """
     if not team_channels:
-        return None, None, None
+        return None, None, None, None, None, None
     
     # Get default channel first
     default_channel_name = team_channels.get('default_channel')
@@ -662,15 +699,20 @@ def get_team_config(team_name, team_channels):
                 print(f"📨 Using channel '{channel_name}' for team {team_name}: {team_chat_id}" + (f" (thread {team_thread_id})" if team_thread_id else ""))
             else:
                 print(f"❌ Channel '{channel_name}' not found in channels config")
-                return None, None, None
+                return None, None, None, None, None, None
         else:
             if default_chat_id:
                 print(f"📨 Using default channel '{default_channel_name}' for team {team_name}: {default_chat_id}" + (f" (thread {default_thread_id})" if default_thread_id else ""))
             else:
                 print(f"❌ No channel specified for team {team_name} and no default channel")
-                return None, None, None
+                return None, None, None, None, None, None
         
-        return team_responsible, team_chat_id, team_thread_id
+        # Get notification settings
+        notification_mode = team_config.get('notification_mode', 'immediate')  # Default to immediate
+        notification_schedule = team_config.get('notification_schedule', [])  # Default to empty list
+        build_types = team_config.get('build_types', None)  # Optional override
+        
+        return team_responsible, team_chat_id, team_thread_id, notification_mode, notification_schedule, build_types
     
     # Try Unknown team as fallback
     elif 'teams' in team_channels and 'Unknown' in team_channels['teams']:
@@ -681,31 +723,36 @@ def get_team_config(team_name, team_channels):
         if 'responsible' in unknown_config:
             team_responsible = {team_name: unknown_config['responsible']}
         
+        # Get notification settings from Unknown team
+        notification_mode = unknown_config.get('notification_mode', 'immediate')
+        notification_schedule = unknown_config.get('notification_schedule', [])
+        build_types = unknown_config.get('build_types', None)
+        
         # Use default channel or Unknown team's channel
         if default_chat_id:
             print(f"📨 Using default channel '{default_channel_name}' for unknown team {team_name}: {default_chat_id}" + (f" (thread {default_thread_id})" if default_thread_id else ""))
-            return team_responsible, default_chat_id, default_thread_id
+            return team_responsible, default_chat_id, default_thread_id, notification_mode, notification_schedule, build_types
         elif 'channel' in unknown_config:
             # Try Unknown team's specific channel
             channel_name = unknown_config['channel']
             if 'channels' in team_channels and channel_name in team_channels['channels']:
                 team_chat_id, team_thread_id = parse_chat_and_thread_id(team_channels['channels'][channel_name])
                 print(f"📨 Using Unknown team channel '{channel_name}' for team {team_name}: {team_chat_id}" + (f" (thread {team_thread_id})" if team_thread_id else ""))
-                return team_responsible, team_chat_id, team_thread_id
+                return team_responsible, team_chat_id, team_thread_id, notification_mode, notification_schedule, build_types
             else:
                 print(f"❌ Unknown team channel '{channel_name}' not found")
-                return None, None, None
+                return None, None, None, None, None, None
         else:
             print(f"❌ No channel configuration found for unknown team {team_name}")
-            return None, None, None
+            return None, None, None, None, None, None
     
     # No configuration found
     else:
         print(f"❌ No channel configuration found for team {team_name}")
-        return None, None, None
+        return None, None, None, None, None, None
 
 
-def send_team_messages(teams, bot_token, delay=2, max_retries=5, retry_delay=10, team_channels=None, dry_run=False, muted_stats=None, include_plots=False, ydb_config=None, debug_plots_dir=None, all_team_data=None, show_diff=False):
+def send_team_messages(teams, bot_token, delay=2, max_retries=5, retry_delay=10, team_channels=None, dry_run=False, muted_stats=None, include_plots=False, ydb_config=None, debug_plots_dir=None, all_team_data=None, show_diff=False, branch='main', build_type='relwithdebinfo'):
     """
     Send separate messages for each team.
     
@@ -723,6 +770,8 @@ def send_team_messages(teams, bot_token, delay=2, max_retries=5, retry_delay=10,
         debug_plots_dir (str): Directory to save debug plot files (if None, debug mode is disabled)
         all_team_data (dict): Pre-fetched team data to avoid repeated queries
         show_diff (bool): Whether to show +/- statistics in messages
+        branch (str): Branch name for notification storage
+        build_type (str): Build type for notification storage
     """
     
     total_teams = len(teams)
@@ -738,7 +787,7 @@ def send_team_messages(teams, bot_token, delay=2, max_retries=5, retry_delay=10,
             continue
         
         # Get team configuration
-        team_responsible, team_chat_id, team_thread_id = get_team_config(team_name, team_channels)
+        team_responsible, team_chat_id, team_thread_id, notification_mode, notification_schedule, build_types = get_team_config(team_name, team_channels)
         
         if not team_chat_id:
             if dry_run:
@@ -747,9 +796,39 @@ def send_team_messages(teams, bot_token, delay=2, max_retries=5, retry_delay=10,
             continue
         
         # Format message
-        message = format_team_message(team_name, issues, team_responsible, muted_stats, show_diff)
+        message = format_team_message(team_name, issues, team_responsible, muted_stats, show_diff, branch=branch)
         
         if not message.strip():
+            continue
+        
+        # Check notification mode: if schedule, store in YDB instead of sending immediately
+        if notification_mode == 'schedule' and NOTIFICATION_STORAGE_AVAILABLE and ydb_config:
+            print(f"📦 Notification mode is 'schedule' for team {team_name}, storing in YDB for aggregation")
+            
+            # Prepare notification data
+            notification_data = {
+                'team_name': team_name,
+                'issues': issues,
+                'message': message,
+                'team_responsible': team_responsible,
+                'muted_stats': muted_stats.get(team_name) if muted_stats and team_name in muted_stats else None,
+                'chat_id': team_chat_id,
+                'thread_id': team_thread_id
+            }
+            
+            # Store notification
+            if store_notification(
+                team_name=team_name,
+                branch=branch,
+                build_type=build_type,
+                notification_data=notification_data,
+                ydb_wrapper=None  # Will create internally
+            ):
+                print(f"✅ Stored notification for team {team_name} (will be sent according to schedule)")
+                sent_count += 1
+            else:
+                print(f"❌ Failed to store notification for team {team_name}")
+            
             continue
         
         # Message will be automatically escaped by send_telegram_message for MarkdownV2
@@ -1014,7 +1093,7 @@ def send_period_updates(period, bot_token, team_channels, ydb_config, delay=2, m
     for team_name in teams_to_process:
         
         # Get team channel configuration
-        team_responsible, team_chat_id, team_thread_id = get_team_config(team_name, team_channels)
+        team_responsible, team_chat_id, team_thread_id, notification_mode, notification_schedule, build_types = get_team_config(team_name, team_channels)
         
         # If team not found in config, use default channel
         if not team_chat_id and team_channels:
@@ -1198,6 +1277,228 @@ def send_period_updates(period, bot_token, team_channels, ydb_config, delay=2, m
     return success_count == total_teams
 
 
+def check_schedule_time(notification_schedule, current_time=None):
+    """
+    Check if current time matches any scheduled time in notification_schedule.
+    
+    Args:
+        notification_schedule (list): List of time strings in format "HH:MM" (24-hour format)
+        current_time (datetime): Current time (defaults to now if None)
+        
+    Returns:
+        bool: True if current time matches any scheduled time (within 5 minutes tolerance)
+    """
+    if not notification_schedule:
+        return False
+    
+    if current_time is None:
+        current_time = datetime.now()
+    
+    current_hour = current_time.hour
+    current_minute = current_time.minute
+    
+    for schedule_time_str in notification_schedule:
+        try:
+            schedule_hour, schedule_minute = map(int, schedule_time_str.split(':'))
+            
+            # Check if current time is within 5 minutes of scheduled time
+            current_total_minutes = current_hour * 60 + current_minute
+            schedule_total_minutes = schedule_hour * 60 + schedule_minute
+            
+            # Handle wrap-around (e.g., 23:58 -> 00:02)
+            diff1 = abs(current_total_minutes - schedule_total_minutes)
+            diff2 = abs(current_total_minutes - schedule_total_minutes + 24 * 60)
+            diff3 = abs(current_total_minutes - schedule_total_minutes - 24 * 60)
+            
+            min_diff = min(diff1, diff2, diff3)
+            
+            if min_diff <= 5:  # 5 minutes tolerance
+                return True
+        except (ValueError, AttributeError):
+            print(f"⚠️ Invalid schedule time format: {schedule_time_str}, expected HH:MM")
+            continue
+    
+    return False
+
+
+def send_aggregated_notifications(
+    bot_token,
+    team_channels,
+    ydb_config,
+    delay=2,
+    max_retries=5,
+    retry_delay=10,
+    dry_run=False,
+    include_plots=False,
+    debug_plots_dir=None
+):
+    """
+    Send aggregated notifications from YDB storage.
+    
+    Args:
+        bot_token (str): Telegram bot token
+        team_channels (dict): Dictionary mapping team names to their channel configurations
+        ydb_config (dict): YDB configuration
+        delay (int): Delay between messages in seconds
+        max_retries (int): Maximum number of retry attempts
+        retry_delay (int): Delay between retry attempts in seconds
+        dry_run (bool): If True, only print messages without sending to Telegram
+        include_plots (bool): If True, include trend plots in messages
+        debug_plots_dir (str): Directory to save debug plot files
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if not NOTIFICATION_STORAGE_AVAILABLE:
+        print("❌ Notification storage not available")
+        return False
+    
+    print("📦 Fetching pending notifications from YDB...")
+    
+    # Get all pending notifications
+    notifications = get_pending_notifications(ydb_wrapper=None)
+    
+    if not notifications:
+        print("ℹ️ No pending notifications found")
+        return True
+    
+    print(f"📊 Found {len(notifications)} pending notifications")
+    
+    # Group notifications by team, branch, and build_type
+    grouped_notifications = {}
+    for notification in notifications:
+        team_name = notification['team_name']
+        branch = notification['branch']
+        build_type = notification['build_type']
+        
+        key = (team_name, branch, build_type)
+        if key not in grouped_notifications:
+            grouped_notifications[key] = []
+        grouped_notifications[key].append(notification)
+    
+    print(f"📋 Grouped into {len(grouped_notifications)} teams/branches/build_types")
+    
+    success_count = 0
+    total_groups = len(grouped_notifications)
+    
+    # Get all team data if plots are requested
+    all_team_data = None
+    if include_plots and ydb_config:
+        print("📊 Fetching all team data for plots...")
+        all_team_data = get_all_team_data(
+            database_endpoint=ydb_config.get('endpoint'),
+            database_path=ydb_config.get('path'),
+            credentials_path=ydb_config.get('credentials'),
+            use_yesterday=ydb_config.get('use_yesterday', False)
+        )
+    
+    for (team_name, branch, build_type), team_notifications in grouped_notifications.items():
+        # Get team configuration
+        team_responsible, team_chat_id, team_thread_id, notification_mode, notification_schedule, build_types = get_team_config(team_name, team_channels)
+        
+        if not team_chat_id:
+            print(f"⚠️ No channel configuration for team: {team_name} (skipping)")
+            continue
+        
+        # Check if it's time to send (if schedule is configured)
+        if notification_schedule:
+            if not check_schedule_time(notification_schedule):
+                print(f"⏰ Not time to send for team {team_name} (schedule: {notification_schedule})")
+                continue
+        
+        # Aggregate all issues from notifications
+        all_issues = []
+        all_muted_stats = {}
+        
+        for notification in team_notifications:
+            notification_data = notification['notification_data']
+            if 'issues' in notification_data:
+                all_issues.extend(notification_data['issues'])
+            if 'muted_stats' in notification_data and notification_data['muted_stats']:
+                # Merge stats (take latest)
+                stats = notification_data['muted_stats']
+                if isinstance(stats, dict):
+                    # If it's a dict with team names as keys, merge it
+                    all_muted_stats.update(stats)
+                elif stats:  # If it's a single stats dict for this team
+                    all_muted_stats[team_name] = stats
+        
+        # Remove duplicates from issues (by URL)
+        seen_urls = set()
+        unique_issues = []
+        for issue in all_issues:
+            if issue['url'] not in seen_urls:
+                seen_urls.add(issue['url'])
+                unique_issues.append(issue)
+        
+        if not unique_issues:
+            print(f"⚠️ No unique issues for team {team_name} after aggregation")
+            # Delete notifications anyway
+            if not dry_run:
+                delete_notifications(team_name=team_name, branch=branch, build_type=build_type)
+            continue
+        
+        # Format aggregated message
+        message = format_team_message(team_name, unique_issues, team_responsible, all_muted_stats if all_muted_stats else None, show_diff=False, branch=branch)
+        
+        if not message.strip():
+            print(f"⚠️ Empty message for team {team_name} after formatting")
+            continue
+        
+        print(f"📨 Sending aggregated message for team: {team_name} ({len(unique_issues)} unique issues)")
+        print("-" * 80)
+        print(message)
+        print("-" * 80)
+        
+        if dry_run:
+            print(f"📋 [DRY RUN] Team: {team_name}, Branch: {branch}, Build Type: {build_type}")
+            print(f"📋 Would send {len(unique_issues)} issues")
+            success_count += 1
+        else:
+            # Get trend plot if requested
+            plot_data = None
+            if include_plots and MATPLOTLIB_AVAILABLE and all_team_data and team_name in all_team_data:
+                trend_data = all_team_data[team_name]['trend']
+                plot_data = create_trend_plot(team_name, trend_data, debug_plots_dir, period=None)
+            
+            # Send message
+            if plot_data:
+                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
+                    tmp_file.write(base64.b64decode(plot_data))
+                    tmp_path = tmp_file.name
+                
+                try:
+                    if send_telegram_message(bot_token, team_chat_id, message, "MarkdownV2", team_thread_id, True, max_retries, retry_delay, photo_path=tmp_path):
+                        success_count += 1
+                        print(f"✅ Aggregated message with plot sent for team: {team_name}")
+                        # Delete notifications after successful send
+                        delete_notifications(team_name=team_name, branch=branch, build_type=build_type)
+                    else:
+                        print(f"❌ Failed to send aggregated message for team: {team_name}")
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+            else:
+                if send_telegram_message(bot_token, team_chat_id, message, "MarkdownV2", team_thread_id, True, max_retries, retry_delay):
+                    success_count += 1
+                    print(f"✅ Aggregated message sent for team: {team_name}")
+                    # Delete notifications after successful send
+                    delete_notifications(team_name=team_name, branch=branch, build_type=build_type)
+                else:
+                    print(f"❌ Failed to send aggregated message for team: {team_name}")
+        
+        # Add delay between messages
+        if success_count < total_groups:
+            time.sleep(delay)
+    
+    if dry_run:
+        print(f"🎉 Dry run completed: {success_count}/{total_groups} aggregated messages formatted!")
+    else:
+        print(f"🎉 Sent {success_count}/{total_groups} aggregated messages successfully!")
+    
+    return success_count == total_groups
+
+
 def main():
     parser = argparse.ArgumentParser(description="Parse team issues and send separate messages for each team")
     
@@ -1218,6 +1519,7 @@ def main():
     mode_group = parser.add_mutually_exclusive_group(required=True)
     mode_group.add_argument('--on-mute-change-update', action='store_true', help='Default mode: send updates about new muted tests')
     mode_group.add_argument('--period-update', choices=['week', 'month'], help='Send periodic trend updates (week or month)')
+    mode_group.add_argument('--send-aggregated', action='store_true', help='Send aggregated notifications from YDB storage')
     
     # YDB arguments for muted tests statistics
     parser.add_argument('--ydb-endpoint', help='YDB database endpoint (or use YDB_ENDPOINT env var)')
@@ -1227,6 +1529,8 @@ def main():
     parser.add_argument('--use-yesterday', action='store_true', help='Use yesterday\'s data for development convenience')
     parser.add_argument('--include-plots', action='store_true', help='Include trend plots in messages (requires matplotlib)')
     parser.add_argument('--debug-plots-dir', help='Directory to save debug plot files (enables debug mode)')
+    parser.add_argument('--branch', default='main', help='Branch name for notification storage (default: main)')
+    parser.add_argument('--build-type', default='relwithdebinfo', help='Build type for notification storage (default: relwithdebinfo)')
     
     args = parser.parse_args()
     
@@ -1249,6 +1553,42 @@ def main():
         sys.exit(1)
     
     print(f"📋 Loaded channel configurations for {len(team_channels.get('teams', {}))} teams")
+    
+    # Handle send-aggregated mode
+    if args.send_aggregated:
+        # Prepare YDB config
+        ydb_config = {
+            'endpoint': args.ydb_endpoint,
+            'path': args.ydb_database,
+            'credentials': args.ydb_credentials,
+            'use_yesterday': args.use_yesterday
+        }
+        
+        # Check if we need Telegram connection (not for dry run)
+        if not args.dry_run:
+            if not bot_token:
+                print("❌ Bot token not provided. Use --bot-token or set TELEGRAM_BOT_TOKEN environment variable")
+                sys.exit(1)
+        
+        # Send aggregated notifications
+        success = send_aggregated_notifications(
+            bot_token=bot_token,
+            team_channels=team_channels,
+            ydb_config=ydb_config,
+            delay=args.delay,
+            max_retries=args.max_retries,
+            retry_delay=args.retry_delay,
+            dry_run=args.dry_run,
+            include_plots=args.include_plots,
+            debug_plots_dir=args.debug_plots_dir
+        )
+        
+        if success:
+            print("✅ Aggregated notifications sent successfully")
+            sys.exit(0)
+        else:
+            print("❌ Failed to send aggregated notifications")
+            sys.exit(1)
     
     # Handle period update mode
     if args.period_update:
@@ -1379,17 +1719,20 @@ def main():
         print(f"  - {team_name}: {len(issues)} issues{responsible_info}{channel_info}")
     
     # Prepare YDB config and get all team data if needed
+    # Always prepare ydb_config if we have credentials (needed for notification storage)
     ydb_config = None
     all_team_data = None
     
-    if args.include_plots and not args.no_stats:
+    # Prepare YDB config for notification storage (even if plots are disabled)
+    if args.ydb_endpoint or args.ydb_database or args.ydb_credentials or os.getenv('YDB_ENDPOINT') or os.getenv('YDB_DATABASE'):
         ydb_config = {
             'endpoint': args.ydb_endpoint,
             'path': args.ydb_database,
             'credentials': args.ydb_credentials,
             'use_yesterday': args.use_yesterday
         }
-        
+    
+    if args.include_plots and not args.no_stats and ydb_config:
         # Get all team data in one optimized query
         print("📊 Fetching all team data in one optimized query...")
         all_team_data = get_all_team_data(
@@ -1418,7 +1761,9 @@ def main():
         ydb_config,
         args.debug_plots_dir,
         all_team_data,
-        MUTE_UPDATE_SHOW_DIFF
+        MUTE_UPDATE_SHOW_DIFF,
+        branch=args.branch,
+        build_type=args.build_type
     )
 
 

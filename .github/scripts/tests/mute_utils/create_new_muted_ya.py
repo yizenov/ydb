@@ -9,8 +9,13 @@ import sys
 from pathlib import Path
 from collections import defaultdict
 
-# Add the parent directory to the path to import update_mute_issues
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Add the parent directory to the path to import update_mute_issues and transform_ya_junit
+tests_dir = Path(__file__).parent.parent
+sys.path.insert(0, str(tests_dir))
+
+# Add mute_utils directory to path for update_mute_issues
+mute_utils_dir = Path(__file__).parent
+sys.path.insert(0, str(mute_utils_dir))
 
 from transform_ya_junit import YaMuteCheck
 from update_mute_issues import (
@@ -21,14 +26,17 @@ from update_mute_issues import (
 )
 
 # Add analytics directory to path for ydb_wrapper import
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'analytics'))
+scripts_dir = Path(__file__).parent.parent.parent
+analytics_dir = scripts_dir / "analytics"
+sys.path.insert(0, str(analytics_dir))
 from ydb_wrapper import YDBWrapper
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-dir = os.path.dirname(__file__)
-repo_path = f"{dir}/../../../"
+# Get repo root path
+repo_root = Path(__file__).parent.parent.parent.parent
+repo_path = str(repo_root)
 muted_ya_path = '.github/config/muted_ya.txt'
 
 # Константы для временных окон mute-логики
@@ -687,7 +695,16 @@ def read_tests_from_file(file_path):
     return result
 
 
-def create_mute_issues(all_tests, file_path, close_issues=True):
+def create_mute_issues(all_tests, file_path, close_issues=True, old_muted_ya_path=None):
+    """
+    Create issues for muted tests and prepare team notifications.
+    
+    Args:
+        all_tests: Aggregated test data from YDB
+        file_path: Path to new muted_ya.txt
+        close_issues: Whether to close unmuted issues
+        old_muted_ya_path: Optional path to old muted_ya.txt (for finding newly muted tests)
+    """
     tests_from_file = read_tests_from_file(file_path)
     muted_tests_in_issues = get_muted_tests_from_issues()
     prepared_tests_by_suite = {}
@@ -696,22 +713,55 @@ def create_mute_issues(all_tests, file_path, close_issues=True):
     # Create set of muted tests for faster lookup
     muted_tests_set = {test['full_name'] for test in tests_from_file}
     
+    # Find newly muted tests if old file is provided
+    newly_muted_set = muted_tests_set
+    if old_muted_ya_path and os.path.exists(old_muted_ya_path):
+        old_tests = read_tests_from_file(old_muted_ya_path)
+        old_tests_set = {test['full_name'] for test in old_tests}
+        newly_muted_set = muted_tests_set - old_tests_set
+        logging.info(f"Found {len(newly_muted_set)} newly muted tests (out of {len(muted_tests_set)} total)")
+    else:
+        logging.info(f"Processing all {len(muted_tests_set)} muted tests (no old file provided)")
+    
     # Check and close issues if needed
     closed_issues = []
     partially_unmuted_issues = []
     if close_issues:
         closed_issues, partially_unmuted_issues = close_unmuted_issues(muted_tests_set)
     
+    # Collect all newly muted tests (both with and without issues) for notifications
+    all_newly_muted_tests = {}  # owner -> list of test info
+    
     # First, collect all tests into temporary dictionary
     for test in all_tests:
         for test_from_file in tests_from_file:
             if test['full_name'] == test_from_file['full_name']:
+                # Only process newly muted tests
+                if test['full_name'] not in newly_muted_set:
+                    continue
+                
+                owner = test.get('owner', 'Unknown')
+                owner_value = owner.split('/', 1)[1] if '/' in owner else owner
+                
+                test_info = {
+                    'mute_string': f"{test.get('suite_folder')} {test.get('test_name')}",
+                    'test_name': test.get('test_name'),
+                    'suite_folder': test.get('suite_folder'),
+                    'full_name': test.get('full_name'),
+                    'owner': owner_value,
+                    'has_issue': test['full_name'] in muted_tests_in_issues,
+                    'issue_url': None
+                }
+                
                 if test['full_name'] in muted_tests_in_issues:
+                    # Test already has issue
+                    test_info['issue_url'] = muted_tests_in_issues[test['full_name']][0]['url']
                     logging.info(
-                        f"test {test['full_name']} already have issue, {muted_tests_in_issues[test['full_name']][0]['url']}"
+                        f"test {test['full_name']} already have issue, {test_info['issue_url']}"
                     )
                 else:
-                    key = f"{test_from_file['testsuite']}:{test['owner']}"
+                    # Test needs new issue
+                    key = f"{test_from_file['testsuite']}:{owner}"
                     if not temp_tests_by_suite.get(key):
                         temp_tests_by_suite[key] = []
                     temp_tests_by_suite[key].append(
@@ -731,6 +781,11 @@ def create_mute_issues(all_tests, file_path, close_issues=True):
                             'branch': test.get('branch'),
                         }
                     )
+                
+                # Add to all newly muted tests for notifications
+                if owner_value not in all_newly_muted_tests:
+                    all_newly_muted_tests[owner_value] = []
+                all_newly_muted_tests[owner_value].append(test_info)
     
     # Split groups larger than 20 tests
     for key, tests in temp_tests_by_suite.items():
@@ -751,9 +806,19 @@ def create_mute_issues(all_tests, file_path, close_issues=True):
         if not result:
             break
         else:
+            issue_url = result['issue_url']
+            # Update test_info with new issue URL
+            for test_info in all_newly_muted_tests.get(owner_value, []):
+                # Find matching test by full_name
+                for test in prepared_tests_by_suite[item]:
+                    if test_info['full_name'] == test['full_name']:
+                        test_info['issue_url'] = issue_url
+                        test_info['has_issue'] = True
+                        break
+            
             results.append(
                 {
-                    'message': f"Created issue '{title}' for TEAM:@ydb-platform/{owner_value}, url {result['issue_url']}",
+                    'message': f"Created issue '{title}' for TEAM:@ydb-platform/{owner_value}, url {issue_url}",
                     'owner': owner_value
                 }
             )
@@ -791,32 +856,35 @@ def create_mute_issues(all_tests, file_path, close_issues=True):
                 formatted_results.append(f"   • `{test}`")
             formatted_results.append("")
     
-    # Add created issues section if any
-    if results:
+    # Add newly muted tests section (all tests, with and without issues)
+    if all_newly_muted_tests:
         if closed_issues or partially_unmuted_issues:
             formatted_results.append("─────────────────────────────")
             formatted_results.append("")
-        formatted_results.append("🆕 **CREATED ISSUES**")
+        formatted_results.append("🆕 **NEWLY MUTED TESTS**")
         formatted_results.append("─────────────────────────────")
         formatted_results.append("")
-    
-        # Add created issues
-        current_owner = None
-        for result in results:
-            if current_owner != result['owner']:
-                if formatted_results and formatted_results[-1] != "":
-                    formatted_results.append('')
-                    formatted_results.append('')
-                current_owner = result['owner']
-                # Add owner header with team URL
-                formatted_results.append(f"👥 **TEAM** @ydb-platform/{current_owner}")
-                formatted_results.append(f"   https://github.com/orgs/ydb-platform/teams/{current_owner}")
-                formatted_results.append("   ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
+        
+        # Sort by owner
+        sorted_owners = sorted(all_newly_muted_tests.keys())
+        
+        for owner in sorted_owners:
+            tests = all_newly_muted_tests[owner]
+            formatted_results.append(f"👥 **TEAM** @ydb-platform/{owner}")
+            formatted_results.append(f"   https://github.com/orgs/ydb-platform/teams/{owner}")
+            formatted_results.append("   ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
             
-            # Extract issue URL and title
-            issue_url = result['message'].split('url ')[-1]
-            title = result['message'].split("'")[1]
-            formatted_results.append(f"   🎯 {issue_url} - `{title}`")
+            for test_info in tests:
+                if test_info['issue_url']:
+                    # Test has issue (newly created or existing)
+                    issue_number = test_info['issue_url'].split('/')[-1]
+                    title = test_info['mute_string']
+                    formatted_results.append(f"   🎯 {test_info['issue_url']} - `{title}`")
+                else:
+                    # Test without issue (shouldn't happen in create_issues mode, but handle it)
+                    formatted_results.append(f"   🎯 `{test_info['mute_string']}`")
+            
+            formatted_results.append("")
 
     print("\n\n")
     print("\n".join(formatted_results))
@@ -857,8 +925,11 @@ def mute_worker(args):
 
         logging.info("Executing single query for 7 days window...")
         
+        # Get build_type from args or use default
+        build_type = getattr(args, 'build_type', 'relwithdebinfo')
+        
         # Один запрос за максимальный период (7 дней)
-        all_data = execute_query(args.branch, days_window=7)
+        all_data = execute_query(args.branch, build_type, days_window=7)
         logging.info(f"Query returned {len(all_data)} test records")
         
         # Используем универсальную агрегацию для разных периодов
@@ -878,8 +949,91 @@ def mute_worker(args):
         file_path = args.file_path
         logging.info(f"Creating issues from file: {file_path}")
         
+        old_muted_ya_path = getattr(args, 'old_muted_ya_path', None)
         # Используем уже агрегированные данные за 3 дня
-        create_mute_issues(aggregated_for_mute, file_path, close_issues=args.close_issues)
+        create_mute_issues(aggregated_for_mute, file_path, close_issues=args.close_issues, old_muted_ya_path=old_muted_ya_path)
+    
+    elif args.mode == 'prepare_team_notifications':
+        new_muted_ya_path = args.new_muted_ya_path
+        old_muted_ya_path = getattr(args, 'old_muted_ya_path', None)
+        branch = args.branch
+        build_type = getattr(args, 'build_type', 'relwithdebinfo')
+        
+        logging.info(f"Preparing team notifications from file: {new_muted_ya_path}")
+        logging.info(f"Old file: {old_muted_ya_path}")
+        logging.info(f"Branch: {branch}, Build type: {build_type}")
+        
+        # Get test data from YDB
+        all_data = execute_query(branch, build_type, days_window=7)
+        aggregated_for_mute = aggregate_test_data(all_data, MUTE_DAYS)
+        
+        # Read new and old muted tests
+        new_tests = read_tests_from_file(new_muted_ya_path)
+        old_tests = read_tests_from_file(old_muted_ya_path) if old_muted_ya_path and os.path.exists(old_muted_ya_path) else []
+        
+        # Find newly muted tests
+        new_tests_set = {test['full_name'] for test in new_tests}
+        old_tests_set = {test['full_name'] for test in old_tests}
+        newly_muted = new_tests_set - old_tests_set
+        
+        if not newly_muted:
+            logging.info("No newly muted tests found")
+            return 0
+        
+        logging.info(f"Found {len(newly_muted)} newly muted tests")
+        
+        # Create mapping: full_name -> test_data
+        test_data_map = {test['full_name']: test for test in aggregated_for_mute}
+        
+        # Group by owner
+        tests_by_owner = defaultdict(list)
+        for test_full_name in newly_muted:
+            if test_full_name in test_data_map:
+                test_data = test_data_map[test_full_name]
+                owner = test_data.get('owner', 'Unknown')
+                owner_value = owner.split('/', 1)[1] if '/' in owner else owner
+                tests_by_owner[owner_value].append({
+                    'mute_string': f"{test_data.get('suite_folder', '')} {test_data.get('test_name', '')}",
+                    'full_name': test_full_name
+                })
+        
+        # Format results
+        formatted_results = []
+        
+        if tests_by_owner:
+            formatted_results.append("🆕 **NEWLY MUTED TESTS**")
+            formatted_results.append("─────────────────────────────")
+            formatted_results.append("")
+            
+            sorted_owners = sorted(tests_by_owner.keys())
+            
+            for owner in sorted_owners:
+                tests = tests_by_owner[owner]
+                formatted_results.append(f"👥 **TEAM** @ydb-platform/{owner}")
+                formatted_results.append(f"   https://github.com/orgs/ydb-platform/teams/{owner}")
+                formatted_results.append("   ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
+                
+                for test in tests:
+                    formatted_results.append(f"   🎯 `{test['mute_string']}`")
+                
+                formatted_results.append("")
+        
+        # Write to file
+        if 'GITHUB_WORKSPACE' in os.environ:
+            file_path = os.path.join(os.environ['GITHUB_WORKSPACE'], "created_issues.txt")
+        else:
+            file_path = "created_issues.txt"
+        
+        with open(file_path, 'w') as f:
+            f.write("\n")
+            f.write("\n".join(formatted_results))
+            f.write("\n")
+        
+        if 'GITHUB_OUTPUT' in os.environ:
+            with open(os.environ['GITHUB_OUTPUT'], 'a') as gh_out:
+                gh_out.write(f"created_issues_file={file_path}\n")
+        
+        logging.info(f"Team notifications prepared: {file_path}")
     
     logging.info("Mute worker completed successfully")
 
@@ -902,7 +1056,18 @@ if __name__ == "__main__":
         '--file_path', default=f'{repo_path}/mute_update/to_mute.txt', required=False, help='file path'
     )
     create_issues_parser.add_argument('--branch', default='main', help='Branch to get history')
+    create_issues_parser.add_argument('--build_type', default='relwithdebinfo', help='Build type')
     create_issues_parser.add_argument('--close_issues', action='store_true', default=True, help='Close issues when all tests are unmuted (default: True)')
+    create_issues_parser.add_argument('--old_muted_ya_path', default=None, help='Path to old muted_ya.txt for finding newly muted tests')
+
+    prepare_notifications_parser = subparsers.add_parser(
+        'prepare_team_notifications',
+        help='prepare team notifications for newly muted tests (for stable branches without issues)',
+    )
+    prepare_notifications_parser.add_argument('--new_muted_ya_path', required=True, help='Path to new muted_ya.txt')
+    prepare_notifications_parser.add_argument('--old_muted_ya_path', default=None, help='Path to old muted_ya.txt')
+    prepare_notifications_parser.add_argument('--branch', default='main', help='Branch to get history')
+    prepare_notifications_parser.add_argument('--build_type', default='relwithdebinfo', help='Build type')
 
     args = parser.parse_args()
 

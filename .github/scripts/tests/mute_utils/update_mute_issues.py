@@ -1,11 +1,13 @@
 import os
 import sys
 import requests
+from pathlib import Path
 from github import Github #pip3 install PyGithub
 from urllib.parse import quote_plus
 
 # Import shared GitHub issue utilities
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+script_dir = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(script_dir))
 from github_issue_utils import parse_body
 
 

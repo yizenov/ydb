@@ -15,7 +15,7 @@ env:
   PR_BRANCH_PREFIX: update-muted-ya
   TITLE: "Update muted_ya.txt"
   REVIEWERS: '["ci"]'
-  LABELS: "mute-unmute,not-for-changelog,ok-to-test"
+  LABELS: "mute-unmute,not-for-changelog,ok-to-test,automerge"
   BUILD_TYPE: relwithdebinfo
 
 jobs:
@@ -24,12 +24,22 @@ jobs:
     outputs:
       matrix_branches: ${{ steps.set-matrix.outputs.branches }}
     steps:
-      - id: set-matrix
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+      
+      - name: Read config and set matrix
+        id: set-matrix
         run: |
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "branches=$(echo '${{ github.event.inputs.branches }}' | jq -R -s -c 'split(",")')" >> $GITHUB_OUTPUT
+            # Use provided branches from input
+            BRANCHES=$(echo '${{ github.event.inputs.branches }}' | python3 -c 'import sys, json; print(json.dumps([b.strip() for b in sys.stdin.read().split(",")]))')
+            echo "branches=${BRANCHES}" >> $GITHUB_OUTPUT
           else
-            echo "branches=$(echo '["main","stable-25-2","stable-25-2-1","stable-25-3","stable-25-3-1","stream-nb-25-1"]' | jq -c .)" >> $GITHUB_OUTPUT
+            # Read branches from config
+            BRANCHES=$(python3 .github/scripts/tests/mute_utils/get_analytics_branches.py)
+            echo "branches=${BRANCHES}" >> $GITHUB_OUTPUT
           fi
 
   collect-testowners:
@@ -108,7 +118,7 @@ jobs:
 
       - name: Generate new muted_ya.txt
         run: |
-          .github/scripts/tests/create_new_muted_ya.py update_muted_ya \
+          .github/scripts/tests/mute_utils/create_new_muted_ya.py update_muted_ya \
             --branch=${{ env.BASE_BRANCH }} \
             --muted_ya_file=base_muted_ya.txt
 
