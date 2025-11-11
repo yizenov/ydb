@@ -290,7 +290,9 @@ runs:
           if [ true = ${{ inputs.run_tests }} ]; then
             YA_MAKE_COMMAND+=" --retest"
           fi
-          $YA_MAKE_COMMAND -k --cache-tests --save-graph-to $GRAPH_PATH --save-context-to $CONTEXT_PATH
+          $YA_MAKE_COMMAND -k --cache-tests \
+            --save-graph-to $GRAPH_PATH --save-context-to $CONTEXT_PATH \
+            $YA_MAKE_TARGET
         fi
 
         # Scripts to checkout from main
