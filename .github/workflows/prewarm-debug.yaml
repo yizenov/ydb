@@ -19,6 +19,7 @@ jobs:
         run: |
             echo "branches=$(jq -c '.' .github/config/stable_nightly_branches.json)" >> $GITHUB_OUTPUT
   build_and_test:
+    needs: determine_branches
     strategy:
       fail-fast: false
       matrix:
