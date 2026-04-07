@@ -306,11 +306,19 @@ public:
         return DomainRange_;
     }
 
-private:
     // Returns binary size of the histogram.
-    ui64 GetBinarySize(ui32 nBuckets) const;
+    size_t GetSize() const {
+        return GetBinarySize(NumBuckets_);
+    }
 
+    static ui64 GetBinarySize(ui32 nBuckets) {
+        return sizeof(VersionNumber_) + sizeof(nBuckets) +
+               sizeof(EHistogramValueType) + sizeof(TDomainRange) + sizeof(ui64) * nBuckets;
+    }
+
+private:
     ui8 VersionNumber_ = 0;
+    ui32 NumBuckets_;
     EHistogramValueType ValueType_;
     TDomainRange DomainRange_;
     TVector<ui64> Buckets_;

@@ -81,8 +81,8 @@ void TestHistogramAggregate(ui32 numBuckets, std::pair<TRange, TRange> range, st
     UNIT_ASSERT(histogram);
     PopulateHistogram<TRange>(histogram, range, valueType);
     auto histogramToAdd = CreateHistogram<TDomain>(numBuckets, domainRange.first, domainRange.second, valueType);
-    PopulateHistogram<TRange>(histogramToAdd, range, valueType);
     UNIT_ASSERT(histogramToAdd);
+    PopulateHistogram<TRange>(histogramToAdd, range, valueType);
     for (ui32 i = 0; i < numCombine; ++i) {
         histogram->Aggregate(*histogramToAdd);
     }
