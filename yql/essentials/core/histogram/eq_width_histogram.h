@@ -415,21 +415,58 @@ public:
             return SuffixSum_.front();
         }
 
+        // at border value, in EstimateGreater,
+        //  we return all the values to the right plus average count of current bucket.
         const auto index = Histogram_->FindBucketIndex(val);
         const auto numBuckets = Histogram_->GetNumBuckets();
-        // TODO: handle the case at the border
-        // const auto border = Histogram_->GetBorderValue<T>(index);
-        // if (val == border) {
-        //     if (index + 1 == numBuckets) {
-        //         return 0;
-        //     }
-        //     return SuffixSum_[index + 1];
-        // }
-
         if (index + 1 == numBuckets) {
             return EstimateEqual(val);
         }
         return SuffixSum_[index + 1] + EstimateEqual(val);
+    }
+
+    // `left val` < all values < `right val`.
+    template <typename T>
+    ui64 EstimateRangeGreaterLess(T leftVal, T rightVal) const {
+        if (leftVal > rightVal) {
+            return 0;
+        }
+        const ui64 right = EstimateLess(rightVal);
+        const ui64 left = EstimateLessOrEqual(leftVal);
+        return right > left ? right - left : 0;
+    }
+
+    // `left val` < all values <= `right val`.
+    template <typename T>
+    ui64 EstimateRangeGreaterLessOrEqual(T leftVal, T rightVal) const {
+        if (leftVal > rightVal) {
+            return 0;
+        }
+        const ui64 right = EstimateLessOrEqual(rightVal);
+        const ui64 left = EstimateLessOrEqual(leftVal);
+        return right > left ? right - left : 0;
+    }
+
+    // `left val` <= all values < `right val`.
+    template <typename T>
+    ui64 EstimateRangeGreaterOrEqualLess(T leftVal, T rightVal) const {
+        if (leftVal > rightVal) {
+            return 0;
+        }
+        const ui64 right = EstimateLess(rightVal);
+        const ui64 left = EstimateLess(leftVal);
+        return right > left ? right - left : 0;
+    }
+
+    // `left val` <= all values <= `right val`.
+    template <typename T>
+    ui64 EstimateRangeGreaterOrEqualLessOrEqual(T leftVal, T rightVal) const {
+        if (leftVal > rightVal) {
+            return 0;
+        }
+        const ui64 right = EstimateLessOrEqual(rightVal);
+        const ui64 left = EstimateLess(leftVal);
+        return right > left ? right - left : 0;
     }
 
     template <typename T>
@@ -443,7 +480,8 @@ public:
             const ui64 width = LoadFrom<ui64>(bucketWidth.Value.data());
             return count / width;
         }
-        // TODO: currenty return count due to close-to-zero width thus count / width generates large value
+        // TODO: close-to-zero width generates large value (i.e. count / width),
+        //  thus return count for now.
         // const T width = LoadFrom<T>(bucketWidth.Value.data());
         // return static_cast<ui64>(count / width);
         return count;
