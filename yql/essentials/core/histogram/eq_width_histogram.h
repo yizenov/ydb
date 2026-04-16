@@ -455,6 +455,40 @@ public:
         return PrefixSum_.back();
     }
 
+    // Returns cardinality of overlapping keys based on PK domain bucket counts.
+    // NOTE: number of buckets and widths may differ (e.g. PK-FK) due to different min/max values.
+    // Also, max value can be large than the last bucket border value.
+    TMaybe<ui64> GetOverlappingCardinality(const TEqWidthHistogramEstimator& other) const {
+        Y_ENSURE(Histogram_->GetType() == other.Histogram_->GetType(), "Histogram value types must match");
+        switch (Histogram_->GetType()) {
+#define HIST_TYPE_CHECK(type, layout)                          \
+    case EHistogramValueType::type: {                          \
+        return GetOverlappingCardinalityHelper<layout>(other); \
+    }
+            KNOWN_FIXED_HISTOGRAM_TYPES(HIST_TYPE_CHECK)
+#undef HIST_TYPE_CHECK
+            default:
+                Y_ENSURE(false, "Unsupported histogram data type");
+                return Nothing();
+        }
+    }
+
+    // Assumes that domain is PK, otherDomain is FK (i.e. FK is a subset of PK)
+    template <typename T>
+    ui64 GetOverlappingCardinalityHelper(const TEqWidthHistogramEstimator& other) const {
+        const T otherDomainStart = LoadFrom<T>(other.Histogram_->GetDomainRange().Start.data());
+        const T otherDomainEnd = LoadFrom<T>(other.Histogram_->GetDomainRange().End.data());
+
+        ui32 leftIndex = Histogram_->FindBucketIndex(otherDomainStart);
+        ui32 rightIndex = Histogram_->FindBucketIndex(otherDomainEnd);
+
+        ui64 cardinality = 0;
+        for (size_t i = leftIndex; i < rightIndex + 1; ++i) {
+            cardinality += Histogram_->GetNumElementsInBucket(i);
+        }
+        return cardinality;
+    }
+
 private:
     void CreatePrefixSum(ui32 numBuckets);
     void CreateSuffixSum(ui32 numBuckets);
