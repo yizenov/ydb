@@ -52,7 +52,7 @@ public:
     static THyperLogLogWithAlloc Load(IInputStream& in) {
         char precision = {};
         Y_ENSURE(in.ReadChar(precision));
-        auto res = Create(precision);
+        auto res = Create(static_cast<unsigned char>(precision));
         in.LoadOrFail(res.Registers.data(), res.Registers.size() * sizeof(res.Registers.front()));
         return res;
     }

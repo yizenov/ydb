@@ -17,7 +17,7 @@ namespace {
         TLookup Biases;
 
         double GetBias(double e) const {
-            for (size_t idx = 0;; ++idx) {
+            for (size_t idx = 0; idx < Estimations.size(); ++idx) {
                 const auto estr = Estimations[idx];
                 if (estr >= e) {
                     if (idx == 0) {
@@ -32,9 +32,10 @@ namespace {
                     return biasl + scale * db / de;
                 } else if (std::fabs(estr) < 1e-4) {
                     //limiter
-                    return Biases[idx - 1];
+                    return idx == 0 ? Biases[0] : Biases[idx - 1];
                 }
             }
+            return Biases.back();
         }
     };
 
@@ -90,7 +91,7 @@ namespace {
     double RawEstimate(const ui8* counts, size_t size) {
         double sum = {};
         for (size_t i = 0; i < size; ++i) {
-            sum += std::pow(2.0, -counts[i]);
+            sum += std::ldexp(1.0, -counts[i]);
         }
         return EmpiricAlpha(size) * size * size / sum;
     }
@@ -128,7 +129,8 @@ ui64 THyperLogLogBase::Estimate() const {
     const auto e_ = e <= 5 * m ? (e - EstimateBias(e, Precision)) : e;
     const auto v = std::count(RegistersRef.begin(), RegistersRef.end(), ui8(0));
     const auto h = v != 0 ? LinearCounting(m, v) : e_;
-    return h <= GetThreshold(Precision) ? h : e_;
+    const double result = h <= GetThreshold(Precision) ? h : e_;
+    return static_cast<ui64>(std::max(0.0, result));
 }
 
 void THyperLogLogBase::Save(IOutputStream& out) const {
