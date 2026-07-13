@@ -443,7 +443,7 @@ public:
         // Due to values which exceed the domain min/max.
         const T domainStart = LoadFrom<T>(Histogram_->GetDomainRange().Start.data());
         const T domainEnd = LoadFrom<T>(Histogram_->GetDomainRange().End.data());
-        if (CmpLess<T>(domainEnd, val)) {
+        if (CmpLess<T>(domainEnd, val) || CmpEqual(domainEnd, val)) {
             return 0;
         } else if (CmpLess<T>(val, domainStart)) {
             return SuffixSum_.front();
@@ -507,7 +507,7 @@ public:
     ui64 EstimateEqual(T val) const {
         const auto index = Histogram_->FindBucketIndex(val);
         const auto count = Histogram_->GetNumElementsInBucket(index);
-        const TEqWidthHistogram::THistValue bucketWidth = Histogram_->GetBucketWidth<T>();
+        const TEqWidthHistogram::THistValue bucketWidth = Histogram_->GetBucketWidthAt<T>(index);
         // Assuming uniform distribution.
         // Final estimated values are truncated after division.
         if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>) {
