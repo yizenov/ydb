@@ -1,6 +1,7 @@
 #include "count_min_sketch.h"
 
 #include <util/system/compiler.h>
+#include <util/generic/yexception.h>
 
 #include <cstdlib>
 
@@ -9,6 +10,7 @@ namespace NKikimr {
 TCountMinSketch* TCountMinSketch::Create(ui64 width, ui64 depth) {
     auto size = StaticSize(width, depth);
     auto* data = ::malloc(size);
+    Y_ENSURE(data);
     auto* sketch = reinterpret_cast<TCountMinSketch*>(data);
     std::memset(sketch, 0, size);
     sketch->Width_ = width;
@@ -18,9 +20,21 @@ TCountMinSketch* TCountMinSketch::Create(ui64 width, ui64 depth) {
 }
 
 TCountMinSketch* TCountMinSketch::FromString(const char* data, size_t size) {
+    Y_ENSURE(size >= sizeof(TCountMinSketch));
+    size_t bucketBytes = size - sizeof(TCountMinSketch);
+    Y_ENSURE(bucketBytes % sizeof(ui32) == 0);
+
     auto* from = reinterpret_cast<const TCountMinSketch*>(data);
-    Y_ABORT_UNLESS(StaticSize(from->Width_, from->Depth_) == size);
+    ui64 width = from->Width_;
+    ui64 depth = from->Depth_;
+    Y_ENSURE(width != 0 && depth != 0);
+
+    ui64 numBuckets = bucketBytes / sizeof(ui32);
+    Y_ENSURE(width <= numBuckets && numBuckets % width == 0 && numBuckets / width == depth);
+
     auto* dataDst = ::malloc(size);
+    Y_ENSURE(dataDst);
+
     std::memcpy(dataDst, data, size);
     return reinterpret_cast<TCountMinSketch*>(dataDst);
 }
@@ -65,15 +79,15 @@ ui32 TCountMinSketch::Probe(const char* data, size_t size) const {
 
 // Returns cardinality of overlapping keys based on PK domain bucket counts.
 // NOTE: this method works given the same column domain, hashing method and seeds, as well as equal width and depth.
-TMaybe<ui32> TCountMinSketch::GetOverlappingCardinality(const TCountMinSketch& rhs) const {
+TMaybe<ui64> TCountMinSketch::GetOverlappingCardinality(const TCountMinSketch& rhs) const {
     if (Width_ != rhs.Width_ || Depth_ != rhs.Depth_) {
         return Nothing();
     }
 
-    ui32 minCardinality = std::numeric_limits<ui32>::max();
+    ui64 minCardinality = std::numeric_limits<ui64>::max();
 
     for (ui64 d = 0; d < Depth_; ++d) {
-        ui32 cardinality = 0;
+        ui64 cardinality = 0;
         for (ui64 w = 0; w < Width_; ++w) {
             ui64 idx = d * Width_ + w;
             cardinality += std::min(Buckets()[idx], rhs.Buckets()[idx]);
@@ -85,9 +99,7 @@ TMaybe<ui32> TCountMinSketch::GetOverlappingCardinality(const TCountMinSketch& r
 }
 
 TCountMinSketch& TCountMinSketch::operator+=(const TCountMinSketch& rhs) {
-    if (Width_ != rhs.Width_ || Depth_ != rhs.Depth_) {
-        return *this;
-    }
+    Y_ENSURE(Width_ == rhs.Width_ && Depth_ == rhs.Depth_);
     ui32* dst = Buckets();
     const ui32* src = rhs.Buckets();
     ui32* end = dst + Width_ * Depth_;
