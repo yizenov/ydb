@@ -3068,6 +3068,82 @@ Y_UNIT_TEST_SUITE(KqpRboYql) {
         UNIT_ASSERT_C(!FindOperatorByStringField(simplifiedPlan, "Table", "Table"), plan);
     }
 
+    // Phase 2 of new-RBO index support: automatic selection of a NON-covering secondary index. The
+    // read is served from the index impl table (for the primary key) plus a stream lookup back to
+    // the base table to fetch the columns the index does not cover.
+    Y_UNIT_TEST(IndexAutoSelectNonCovering) {
+        NKikimrConfig::TAppConfig appConfig;
+        appConfig.MutableTableServiceConfig()->SetEnableNewRBO(true);
+        appConfig.MutableTableServiceConfig()->SetEnableFallbackToYqlOptimizer(false);
+        appConfig.MutableTableServiceConfig()->SetDefaultLangVer(NYql::GetMaxLangVersion());
+        appConfig.MutableTableServiceConfig()->SetBackportMode(NKikimrConfig::TTableServiceConfig_EBackportMode_All);
+        TKikimrRunner kikimr(NKqp::TKikimrSettings(appConfig).SetWithSampleTables(false));
+
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+
+        auto schemeResult = session.ExecuteSchemeQuery(R"(
+            CREATE TABLE `/Root/Table` (
+                Key Int32,
+                SubKey1 Int32,
+                SubKey2 String,
+                Value1 String,
+                Value2 String,
+                PRIMARY KEY (Key, SubKey1, SubKey2)
+            );
+        )").GetValueSync();
+        UNIT_ASSERT_C(schemeResult.IsSuccess(), schemeResult.GetIssues().ToString());
+
+        struct TRow { i32 Key; i32 SubKey1; TString SubKey2; TString Value1; TString Value2; };
+        const TVector<TRow> tableRows = {
+            {0, 0, "0", "1", "1"}, {0, 0, "1", "2", "2"},
+            {0, 1, "0", "3", "3"}, {0, 1, "1", "4", "4"},
+            {1, 0, "0", "5", "5"}, {1, 0, "1", "6", "6"},
+            {1, 1, "0", "7", "7"}, {1, 1, "1", "8", "8"},
+        };
+        NYdb::TValueBuilder rows;
+        rows.BeginList();
+        for (const auto& r : tableRows) {
+            rows.AddListItem()
+                .BeginStruct()
+                .AddMember("Key").Int32(r.Key)
+                .AddMember("SubKey1").Int32(r.SubKey1)
+                .AddMember("SubKey2").String(r.SubKey2)
+                .AddMember("Value1").String(r.Value1)
+                .AddMember("Value2").String(r.Value2)
+                .EndStruct();
+        }
+        rows.EndList();
+        auto upsert = db.BulkUpsert("/Root/Table", rows.Build()).GetValueSync();
+        UNIT_ASSERT_C(upsert.IsSuccess(), upsert.GetIssues().ToString());
+
+        // Index21 = (SubKey2, Value1): its leading key column SubKey2 is constrained by the filter,
+        // but it does NOT cover Value2, so the read needs a lookup back to the base table.
+        auto indexResult = session.ExecuteSchemeQuery(R"(
+            ALTER TABLE `/Root/Table` ADD INDEX Index21 GLOBAL ON (SubKey2, Value1);
+        )").GetValueSync();
+        UNIT_ASSERT_C(indexResult.IsSuccess(), indexResult.GetIssues().ToString());
+
+        const TString query = R"(
+            SELECT Value2
+            FROM `/Root/Table`
+            WHERE SubKey2 = "0"
+            ORDER BY Value2;
+        )";
+
+        auto result = session.ExecuteDataQuery(query, TTxControl::BeginTx().CommitTx()).GetValueSync();
+        UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+        UNIT_ASSERT_VALUES_EQUAL(FormatResultSetYson(result.GetResultSet(0)), R"([[["1"]];[["3"]];[["5"]];[["7"]]])");
+
+        // Plan: the index impl table is read, and a stream lookup fetches Value2 from the base table.
+        auto db2 = kikimr.GetQueryClient();
+        auto session2 = db2.GetSession().GetValueSync().GetSession();
+        auto plan = ExecuteExplain(session2, query);
+        auto simplifiedPlan = GetSimplifiedPlan(plan);
+        UNIT_ASSERT_C(FindOperatorByStringField(simplifiedPlan, "Table", "indexImplTable"), plan);
+        UNIT_ASSERT_C(plan.Contains("Lookup"), plan);
+    }
+
     Y_UNIT_TEST(LookupJoins) {
         NKikimrConfig::TAppConfig appConfig;
         appConfig.MutableTableServiceConfig()->SetEnableNewRBO(false);

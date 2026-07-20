@@ -111,24 +111,46 @@ TIntrusivePtr<IOperator> TSelectIndexRule::SimpleMatchAndApply(const TIntrusiveP
         return {buildResult.PointPrefixLen, buildResult.UsedPrefixLen};
     };
 
+    // The primary-key columns as the read exposes them. These are the lookup keys for a non-covering
+    // index and the eligibility gate: the non-covering rewrite reads exactly the PK from the index,
+    // so the filter must be evaluable on the PK alone (we do not yet project extra index columns
+    // before the lookup).
+    TVector<TInfoUnit> pkIUs;
+    for (const auto& pk : tableDesc->Metadata->KeyColumnNames) {
+        pkIUs.emplace_back(read->Alias, pk);
+    }
+    bool filterOnPkOnly = true;
+    for (const auto& iu : filter->GetFilterIUs(props)) {
+        if (std::find(pkIUs.begin(), pkIUs.end(), iu) == pkIUs.end()) {
+            filterOnPkOnly = false;
+            break;
+        }
+    }
+
     // The primary key is the baseline; an index must strictly beat it to be worth choosing.
     TIndexScore bestScore = scoreKeyColumns(tableDesc->Metadata->KeyColumnNames);
     TMaybe<TString> bestIndex;
     TIntrusivePtr<TKikimrTableMetadata> bestImpl;
+    bool bestCovering = true;
     for (size_t i = 0; i < tableDesc->Metadata->Indexes.size(); ++i) {
         const auto& index = tableDesc->Metadata->Indexes[i];
         if (!IsIndexEligible(index)) {
             continue;
         }
         const auto& implMeta = tableDesc->Metadata->ImplTables[i];
-        if (!implMeta || !IndexCoversRead(*implMeta, *read)) {
+        if (!implMeta) {
             continue;
+        }
+        const bool covers = IndexCoversRead(*implMeta, *read);
+        if (!covers && !filterOnPkOnly) {
+            continue; // Phase 2 limitation: non-covering rewrite only when the filter is PK-only.
         }
         const TIndexScore score = scoreKeyColumns(index.KeyColumns);
         if (score > bestScore) {
             bestScore = score;
             bestIndex = index.Name;
             bestImpl = implMeta;
+            bestCovering = covers;
         }
     }
 
@@ -137,11 +159,10 @@ TIntrusivePtr<IOperator> TSelectIndexRule::SimpleMatchAndApply(const TIntrusiveP
     }
 
     YQL_CLOG(TRACE, ProviderKqp) << "[NEW RBO][index] table=" << tablePath << " selected index=" << *bestIndex
-                                 << " pointPrefix=" << bestScore.first << " usedPrefix=" << bestScore.second;
+                                 << " covering=" << bestCovering << " pointPrefix=" << bestScore.first
+                                 << " usedPrefix=" << bestScore.second;
 
-    // Retarget the read to the index impl table. Inlined BuildTableMeta (rbo cannot PEERDIR its
-    // parent kqp/opt without a cycle). The filter stays above the read unchanged: we only redirect
-    // the source, we do not yet push ranges into it.
+    // Inlined BuildTableMeta for the index impl table (rbo cannot PEERDIR its parent kqp/opt).
     // clang-format off
     auto implTableMeta = Build<TKqpTable>(ctx, read->Pos)
         .Path().Build(bestImpl->Name)
@@ -151,10 +172,40 @@ TIntrusivePtr<IOperator> TSelectIndexRule::SimpleMatchAndApply(const TIntrusiveP
     .Done();
     // clang-format on
 
-    auto newRead = MakeIntrusive<TOpRead>(read->Alias, read->Columns, read->GetOutputIUs(), read->StorageType,
-                                          implTableMeta.Ptr(), read->OlapFilterLambda, read->Limit, std::nullopt,
-                                          read->OriginalPredicate, read->SortDir, read->Props, read->Pos);
-    return MakeIntrusive<TOpFilter>(newRead, filter->Pos, filter->Props, filter->FilterExpr);
+    if (bestCovering) {
+        // Covering: redirect the read to the impl table; the filter stays above it unchanged.
+        auto newRead = MakeIntrusive<TOpRead>(read->Alias, read->Columns, read->GetOutputIUs(), read->StorageType,
+                                              implTableMeta.Ptr(), read->OlapFilterLambda, read->Limit, std::nullopt,
+                                              read->OriginalPredicate, read->SortDir, read->Props, read->Pos);
+        return MakeIntrusive<TOpFilter>(newRead, filter->Pos, filter->Props, filter->FilterExpr);
+    }
+
+    // Non-covering: read exactly the primary key from the index impl, apply the filter on the index,
+    // then stream-lookup the base table by that key to fetch the originally requested columns.
+    //
+    // The stream lookup matches its input struct fields to the table's key columns by their plain,
+    // unqualified names, so the index read exposes the PK under plain names (empty alias) and the
+    // filter's PK references are renamed to match. The lookup's output is renamed back to the read's
+    // qualified output IUs during physical conversion.
+    TVector<TString> pkColumns(tableDesc->Metadata->KeyColumnNames.begin(), tableDesc->Metadata->KeyColumnNames.end());
+    TVector<TInfoUnit> pkIUsPlain;
+    for (const auto& pk : pkColumns) {
+        pkIUsPlain.emplace_back(TString(), pk);
+    }
+
+    auto indexRead = MakeIntrusive<TOpRead>(read->Alias, pkColumns, pkIUsPlain, read->StorageType,
+                                            implTableMeta.Ptr(), nullptr, nullptr, std::nullopt, std::nullopt,
+                                            ESortDir::None, read->Props, read->Pos);
+    auto indexFilter = MakeIntrusive<TOpFilter>(indexRead, filter->Pos, filter->Props, filter->FilterExpr);
+
+    THashMap<TInfoUnit, TInfoUnit, TInfoUnit::THashFunction> renameMap;
+    for (const auto& pk : pkColumns) {
+        renameMap[TInfoUnit(read->Alias, pk)] = TInfoUnit(TString(), pk);
+    }
+    indexFilter->RenameUsedIUs(renameMap, ctx);
+
+    return MakeIntrusive<TOpTableLookup>(indexFilter, read->Pos, read->TableCallable, read->Columns,
+                                         read->GetOutputIUs(), pkIUsPlain);
 }
 
 } // namespace NKikimr::NKqp

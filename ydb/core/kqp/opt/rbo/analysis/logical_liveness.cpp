@@ -298,6 +298,14 @@ void TOpSort::PropagateLiveness(ILivenessContext& ctx) {
     ctx.AddLiveInput(this, 0, inputLive);
 }
 
+void TOpTableLookup::PropagateLiveness(ILivenessContext& ctx) {
+    // The lookup always consumes exactly its key columns from the input, regardless of which output
+    // columns are live downstream (those are fetched from the main table, not the input).
+    TInfoUnitSet inputLive;
+    AddInfoUnits(inputLive, LookupKeys);
+    ctx.AddLiveInput(this, 0, inputLive);
+}
+
 void TOpAggregate::PropagateLiveness(ILivenessContext& ctx) {
     TInfoUnitSet inputLive;
     AddInfoUnits(inputLive, KeyColumns);

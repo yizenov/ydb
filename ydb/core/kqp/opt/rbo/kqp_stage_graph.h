@@ -107,6 +107,27 @@ struct TSourceConnection: public TConnection {
     virtual NYql::TExprNode::TPtr BuildConnection(NYql::TExprNode::TPtr inputStage, NYql::TPositionHandle pos, NYql::TExprContext& ctx) override;
 };
 
+// Stream lookup of a main table by primary key: the input stage produces the key structs, this
+// connection fetches Columns from Table for each. Lowers to a TKqpCnStreamLookup DQ connection.
+// All node arguments are pre-built at assign-stages time (where the ExprContext and table metadata
+// are available); BuildConnection only wraps the input stage.
+struct TStreamLookupConnection: public TConnection {
+    TStreamLookupConnection(ui32 outputIndex, NYql::TExprNode::TPtr table, NYql::TExprNode::TPtr columns,
+                            NYql::TExprNode::TPtr inputType, NYql::TExprNode::TPtr settings)
+        : TConnection("StreamLookup", outputIndex)
+        , Table(table)
+        , Columns(columns)
+        , InputType(inputType)
+        , Settings(settings) {
+    }
+    virtual NYql::TExprNode::TPtr BuildConnection(NYql::TExprNode::TPtr inputStage, NYql::TPositionHandle pos, NYql::TExprContext& ctx) override;
+
+    NYql::TExprNode::TPtr Table;
+    NYql::TExprNode::TPtr Columns;
+    NYql::TExprNode::TPtr InputType;
+    NYql::TExprNode::TPtr Settings;
+};
+
 template <typename T>
 bool IsConnection(TIntrusivePtr<TConnection> connection) {
     return dynamic_cast<T*>(connection.get());
