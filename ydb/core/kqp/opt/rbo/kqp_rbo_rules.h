@@ -283,6 +283,18 @@ class TPushRangesRule : public ISimplifiedRule {
 };
 
 /**
+ * Automatically redirect a filtered row-table read to a covering secondary index whose key prefix
+ * the predicate constrains better than the primary key. Runs after CBO.
+ */
+class TSelectIndexRule : public ISimplifiedRule {
+  public:
+      TSelectIndexRule() : ISimplifiedRule("Select index", ERuleProperties::RequireParents | ERuleProperties::RequireTypes | ERuleProperties::RequireMetadata) {}
+
+      virtual bool QuickMatch(const TIntrusivePtr<IOperator>& input) const override;
+      virtual TIntrusivePtr<IOperator> SimpleMatchAndApply(const TIntrusivePtr<IOperator>& input, TRBOContext& ctx, TPlanProps& props) override;
+};
+
+/**
  * Push down filter to olap read.
  */
 class TPushOlapFilterRule : public ISimplifiedRule {

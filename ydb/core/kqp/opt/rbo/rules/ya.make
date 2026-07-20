@@ -27,7 +27,9 @@ SRCS(
     push_filter_into_join.cpp
     push_filter_under_map.cpp
     push_limit_into_sort.cpp
+    kqp_rbo_index_selection.cpp
     push_ranges.cpp
+    select_index.cpp
     push_olap_filter.cpp
     push_olap_projection.cpp
     disable_blocks_on_columns_limit.cpp

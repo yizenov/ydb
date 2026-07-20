@@ -524,6 +524,12 @@ void TKqpNewRBOTransformer::InitializeRBOOptimizationStages() {
     cleanUpCBOStageRules.emplace_back(std::make_unique<TPruneDeadMapElementsRule>(pruneKeyColumnsEarly));
     RBO.AddStage(std::make_unique<TRuleBasedStage>("Clean up after CBO", std::move(cleanUpCBOStageRules)));
 
+    // Automatic index selection. Runs after CBO has fixed the join order/algorithms, so it sees the
+    // final set of reads.
+    TVector<std::unique_ptr<IRule>> selectIndexStageRules;
+    selectIndexStageRules.emplace_back(std::make_unique<TSelectIndexRule>());
+    RBO.AddStage(std::make_unique<TRuleBasedStage>("Select indexes", std::move(selectIndexStageRules)));
+
     if (inlineJoinFiltersAfterCBO) {
         TVector<std::unique_ptr<IRule>> inlineJoinFiltersAfterCBORules;
         inlineJoinFiltersAfterCBORules.emplace_back(std::make_unique<TInlineJoinFiltersRule>());
