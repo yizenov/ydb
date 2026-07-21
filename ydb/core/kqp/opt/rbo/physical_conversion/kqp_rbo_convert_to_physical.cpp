@@ -248,6 +248,74 @@ TExprNode::TPtr ConvertToPhysical(TOpRoot& root, TRBOContext& rboCtx) {
             stages[opStageId] = currentStageBody;
             stagePos[opStageId] = op->Pos;
             YQL_CLOG(TRACE, CoreDq) << "Converted TableLookup " << opStageId;
+        } else if (op->Kind == EOperator::LookupJoin) {
+            auto lookupJoin = CastOperator<TOpLookupJoin>(op);
+
+            if (!currentStageBody) {
+                auto [stageArg, stageInput] = graph.GenerateStageInput(stageInputCounter, op->Pos, ctx);
+                stageArgs[opStageId].push_back(stageArg);
+                currentStageBody = stageInput;
+            }
+
+            // The connection delivers a stream of Tuple<leftRow, Optional<rightRow>, ui64>. Combine the
+            // left row (Nth 0) with the fetched right row (Nth 1, present for an inner match) into a
+            // single struct named by the join's output IUs; unmatched left rows (Nothing) are dropped.
+            auto tupleArg = Build<TCoArgument>(ctx, op->Pos).Name("lookup_tuple").Done();
+            auto rightArg = Build<TCoArgument>(ctx, op->Pos).Name("right_row").Done();
+
+            TVector<TExprBase> structItems;
+            for (const auto& iu : lookupJoin->GetInput()->GetOutputIUs()) {
+                structItems.push_back(
+                    Build<TCoNameValueTuple>(ctx, op->Pos)
+                        .Name().Build(iu.GetFullName())
+                        .Value<TCoMember>()
+                            .Struct<TCoNth>()
+                                .Tuple(tupleArg)
+                                .Index().Build("0")
+                                .Build()
+                            .Name().Build(iu.GetFullName())
+                            .Build()
+                        .Done());
+            }
+            for (size_t i = 0; i < lookupJoin->RightOutputIUs.size(); i++) {
+                structItems.push_back(
+                    Build<TCoNameValueTuple>(ctx, op->Pos)
+                        .Name().Build(lookupJoin->RightOutputIUs[i].GetFullName())
+                        .Value<TCoMember>()
+                            .Struct(rightArg)
+                            .Name().Build(lookupJoin->RightFetchColumns[i])
+                            .Build()
+                        .Done());
+            }
+
+            // clang-format off
+            currentStageBody = Build<TCoFlatMap>(ctx, op->Pos)
+                .Input<TCoToStream>()
+                    .Input(currentStageBody)
+                    .Build()
+                .Lambda()
+                    .Args({tupleArg})
+                    .Body<TCoMap>()
+                        .Input<TCoNth>()
+                            .Tuple(tupleArg)
+                            .Index().Build("1")
+                            .Build()
+                        .Lambda()
+                            .Args({rightArg})
+                            .Body(Build<TCoAsStruct>(ctx, op->Pos).Add(structItems).Done())
+                            .Build()
+                        .Build()
+                    .Build()
+            .Done().Ptr();
+            // clang-format on
+
+            if (!lookupJoin->IsSingleConsumer()) {
+                currentStageBody = NPhysicalConvertionUtils::BuildMultiConsumerHandler(currentStageBody, lookupJoin->GetNumOfConsumers(), ctx, op->Pos);
+            }
+
+            stages[opStageId] = currentStageBody;
+            stagePos[opStageId] = op->Pos;
+            YQL_CLOG(TRACE, CoreDq) << "Converted LookupJoin " << opStageId;
         } else {
             Y_ENSURE(false, "Could not generate physical plan");
         }

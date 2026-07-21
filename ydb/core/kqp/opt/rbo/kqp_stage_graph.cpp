@@ -1,5 +1,6 @@
 #include "kqp_stage_graph.h"
 
+#include <ydb/library/yql/dq/type_ann/dq_type_ann.h>
 #include <yql/essentials/utils/log/log.h>
 
 #include <util/generic/guid.h>
@@ -188,6 +189,62 @@ TExprNode::TPtr TSourceConnection::BuildConnection(TExprNode::TPtr inputStage, T
     Y_UNUSED(pos);
     Y_UNUSED(ctx);
     return inputStage;
+}
+
+TExprNode::TPtr TStreamLookupJoinConnection::BuildConnection(TExprNode::TPtr inputStage, TPositionHandle pos, TExprContext& ctx) {
+    // Reshape each left row into a tuple<leftRow, Just(keyStruct)> where keyStruct fields are named
+    // by the right table's key columns and valued from the left row.
+    auto rowArg = Build<TCoArgument>(ctx, pos).Name("left_row").Done();
+    TVector<TExprBase> keyTuples;
+    for (size_t i = 0; i < RightKeyColumns.size(); ++i) {
+        keyTuples.push_back(
+            Build<TCoNameValueTuple>(ctx, pos)
+                .Name().Build(RightKeyColumns[i])
+                .Value<TCoMember>()
+                    .Struct(rowArg)
+                    .Name().Build(LeftKeyNames[i])
+                    .Build()
+                .Done());
+    }
+    auto justKey = Build<TCoJust>(ctx, pos).Input(Build<TCoAsStruct>(ctx, pos).Add(keyTuples).Done()).Done();
+    TVector<TExprBase> tupleItems = {TExprBase(rowArg), TExprBase(justKey)};
+    auto mapLambda = Build<TCoLambda>(ctx, pos)
+        .Args({rowArg})
+        .Body(Build<TExprList>(ctx, pos).Add(tupleItems).Done())
+        .Done();
+
+    auto streamArg = Build<TCoArgument>(ctx, pos).Name("left_stream").Done();
+    // clang-format off
+    auto tupleStage = Build<TDqPhyStage>(ctx, pos)
+        .Inputs()
+            .Add<TDqCnUnionAll>()
+                .Output()
+                    .Stage(inputStage)
+                    .Index().Build(ToString(OutputIndex))
+                    .Build()
+                .Build()
+            .Build()
+        .Program()
+            .Args({streamArg})
+            .Body<TCoMap>()
+                .Input(streamArg)
+                .Lambda(mapLambda)
+                .Build()
+            .Build()
+        .Settings(NYql::NDq::TDqStageSettings().BuildNode(ctx, pos))
+    .Done();
+
+    return Build<TKqpCnStreamLookup>(ctx, pos)
+        .Output()
+            .Stage(tupleStage)
+            .Index().Build("0")
+            .Build()
+        .Table(Table)
+        .Columns(Columns)
+        .InputType(InputType)
+        .Settings(Settings)
+    .Done().Ptr();
+    // clang-format on
 }
 
 TExprNode::TPtr TStreamLookupConnection::BuildConnection(TExprNode::TPtr inputStage, TPositionHandle pos, TExprContext& ctx) {

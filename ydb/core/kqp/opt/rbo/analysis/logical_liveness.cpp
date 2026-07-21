@@ -306,6 +306,20 @@ void TOpTableLookup::PropagateLiveness(ILivenessContext& ctx) {
     ctx.AddLiveInput(this, 0, inputLive);
 }
 
+void TOpLookupJoin::PropagateLiveness(ILivenessContext& ctx) {
+    // The left input must supply every left column that is live downstream, plus the join keys
+    // (needed to probe the right table even if not themselves in the output).
+    const auto& liveOut = ctx.GetLiveOut(this);
+    TInfoUnitSet inputLive;
+    for (const auto& iu : GetInput()->GetOutputIUs()) {
+        if (liveOut.contains(iu)) {
+            AddInfoUnit(inputLive, iu);
+        }
+    }
+    AddInfoUnits(inputLive, LeftKeys);
+    ctx.AddLiveInput(this, 0, inputLive);
+}
+
 void TOpAggregate::PropagateLiveness(ILivenessContext& ctx) {
     TInfoUnitSet inputLive;
     AddInfoUnits(inputLive, KeyColumns);

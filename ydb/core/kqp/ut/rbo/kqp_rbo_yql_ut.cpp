@@ -3144,6 +3144,58 @@ Y_UNIT_TEST_SUITE(KqpRboYql) {
         UNIT_ASSERT_C(plan.Contains("Lookup"), plan);
     }
 
+    // Phase 4 of new-RBO index support: a CBO-selected lookup join. The right table is probed by its
+    // primary key via a LookupJoinRows stream lookup instead of an in-stage hash/grace join.
+    Y_UNIT_TEST(LookupJoinByPk) {
+        NKikimrConfig::TAppConfig appConfig;
+        appConfig.MutableTableServiceConfig()->SetEnableNewRBO(true);
+        appConfig.MutableTableServiceConfig()->SetEnableFallbackToYqlOptimizer(false);
+        appConfig.MutableTableServiceConfig()->SetDefaultLangVer(NYql::GetMaxLangVersion());
+        appConfig.MutableTableServiceConfig()->SetBackportMode(NKikimrConfig::TTableServiceConfig_EBackportMode_All);
+        TKikimrRunner kikimr(NKqp::TKikimrSettings(appConfig).SetWithSampleTables(false));
+
+        auto db = kikimr.GetTableClient();
+        auto session = db.CreateSession().GetValueSync().GetSession();
+
+        UNIT_ASSERT_C(session.ExecuteSchemeQuery(R"(
+            CREATE TABLE `/Root/Main` (Key Int32, Payload String, PRIMARY KEY (Key));
+            CREATE TABLE `/Root/Ref` (Key Int32, Name String, PRIMARY KEY (Key));
+        )").GetValueSync().IsSuccess(), "create tables");
+
+        auto loadTable = [&](const TString& path, const TVector<std::pair<i32, TString>>& data, const TString& valueCol) {
+            NYdb::TValueBuilder rows;
+            rows.BeginList();
+            for (const auto& [key, value] : data) {
+                rows.AddListItem().BeginStruct()
+                    .AddMember("Key").Int32(key)
+                    .AddMember(valueCol).String(value)
+                    .EndStruct();
+            }
+            rows.EndList();
+            UNIT_ASSERT_C(db.BulkUpsert(path, rows.Build()).GetValueSync().IsSuccess(), "bulk upsert " + path);
+        };
+        loadTable("/Root/Main", {{1, "a"}, {2, "b"}, {3, "c"}}, "Payload");
+        loadTable("/Root/Ref", {{1, "x"}, {2, "y"}}, "Name");
+
+        const TString query = R"(
+            PRAGMA ydb.CostBasedOptimizationLevel = '3';
+            PRAGMA ydb.OptShuffleElimination = 'false';
+            SELECT m.Payload, r.Name
+            FROM `/Root/Main` AS m
+            INNER JOIN `/Root/Ref` AS r ON m.Key = r.Key
+            ORDER BY m.Payload;
+        )";
+
+        auto result = session.ExecuteDataQuery(query, TTxControl::BeginTx().CommitTx()).GetValueSync();
+        UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+        UNIT_ASSERT_VALUES_EQUAL(FormatResultSetYson(result.GetResultSet(0)), R"([[["a"];["x"]];[["b"];["y"]]])");
+
+        auto db2 = kikimr.GetQueryClient();
+        auto session2 = db2.GetSession().GetValueSync().GetSession();
+        auto plan = ExecuteExplain(session2, query);
+        UNIT_ASSERT_C(plan.Contains("Lookup"), plan);
+    }
+
     Y_UNIT_TEST(LookupJoins) {
         NKikimrConfig::TAppConfig appConfig;
         appConfig.MutableTableServiceConfig()->SetEnableNewRBO(false);

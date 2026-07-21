@@ -1043,6 +1043,43 @@ TString TOpTableLookup::ToString(TExprContext& ctx) {
     return res;
 }
 
+TOpLookupJoin::TOpLookupJoin(TIntrusivePtr<IOperator> leftInput, TPositionHandle pos, const TString& joinKind, const TExprNode::TPtr& table,
+                             const TVector<TString>& rightFetchColumns, const TVector<TInfoUnit>& rightOutputIUs,
+                             const TVector<TInfoUnit>& leftKeys, const TVector<TString>& rightKeyColumns)
+    : IUnaryOperator(EOperator::LookupJoin, pos, leftInput)
+    , JoinKind(joinKind)
+    , Table(table)
+    , RightFetchColumns(rightFetchColumns)
+    , RightOutputIUs(rightOutputIUs)
+    , LeftKeys(leftKeys)
+    , RightKeyColumns(rightKeyColumns) {
+}
+
+void TOpLookupJoin::ComputeOutputIUs() {
+    TVector<TInfoUnit> res = GetInput()->GetOutputIUs();
+    res.insert(res.end(), RightOutputIUs.begin(), RightOutputIUs.end());
+    Props.OutputIUs = std::move(res);
+}
+
+TVector<TInfoUnit> TOpLookupJoin::GetUsedIUs(TPlanProps& props) {
+    Y_UNUSED(props);
+    return LeftKeys;
+}
+
+TString TOpLookupJoin::ToString(TExprContext& ctx) {
+    Y_UNUSED(ctx);
+    TStringBuilder res;
+    res << "LookupJoin (" << JoinKind << "): " << TKqpTable(Table).Path().StringValue() << ", on [";
+    for (size_t i = 0; i < LeftKeys.size(); i++) {
+        res << LeftKeys[i].GetFullName() << "=" << RightKeyColumns[i];
+        if (i + 1 < LeftKeys.size()) {
+            res << ", ";
+        }
+    }
+    res << "]";
+    return res;
+}
+
 NJson::TJsonValue TOpSort::ToJson(ui32 explainFlags) {
     auto res = IOperator::ToJson(explainFlags);
     if (IsTopSort()) {

@@ -128,6 +128,32 @@ struct TStreamLookupConnection: public TConnection {
     NYql::TExprNode::TPtr Settings;
 };
 
+// Stream lookup JOIN: for each left row, probe Table by the right key columns (values taken from the
+// left row's LeftKeyNames) and emit tuple<leftRow, Optional<rightRow>, ui64>. BuildConnection first
+// builds a tuple-shaping stage (leftRow -> tuple<leftRow, Optional<keyStruct>>) over the input stage,
+// then a TKqpCnStreamLookup with strategy LookupJoinRows over it.
+struct TStreamLookupJoinConnection: public TConnection {
+    TStreamLookupJoinConnection(ui32 outputIndex, const TVector<TString>& leftKeyNames, const TVector<TString>& rightKeyColumns,
+                                NYql::TExprNode::TPtr table, NYql::TExprNode::TPtr columns, NYql::TExprNode::TPtr inputType,
+                                NYql::TExprNode::TPtr settings)
+        : TConnection("StreamLookupJoin", outputIndex)
+        , LeftKeyNames(leftKeyNames)
+        , RightKeyColumns(rightKeyColumns)
+        , Table(table)
+        , Columns(columns)
+        , InputType(inputType)
+        , Settings(settings) {
+    }
+    virtual NYql::TExprNode::TPtr BuildConnection(NYql::TExprNode::TPtr inputStage, NYql::TPositionHandle pos, NYql::TExprContext& ctx) override;
+
+    TVector<TString> LeftKeyNames;
+    TVector<TString> RightKeyColumns;
+    NYql::TExprNode::TPtr Table;
+    NYql::TExprNode::TPtr Columns;
+    NYql::TExprNode::TPtr InputType;
+    NYql::TExprNode::TPtr Settings;
+};
+
 template <typename T>
 bool IsConnection(TIntrusivePtr<TConnection> connection) {
     return dynamic_cast<T*>(connection.get());

@@ -148,6 +148,28 @@ void TOpTableLookup::ComputeMetadata(TRBOContext& ctx, TPlanProps& planProps) {
 }
 
 /***
+ * Metadata for a lookup join: left columns come from the left input, right columns are fetched from
+ * the right table by key. Start from the left input's metadata (key columns / left lineage) and add
+ * lineage entries for the fetched right columns.
+ */
+void TOpLookupJoin::ComputeMetadata(TRBOContext& ctx, TPlanProps& planProps) {
+    Y_UNUSED(ctx);
+    Y_UNUSED(planProps);
+    Props.Metadata = GetInput()->Props.Metadata;
+    if (!Props.Metadata.has_value()) {
+        Props.Metadata = TRBOMetadata();
+    }
+
+    auto path = TKqpTable(Table).Path();
+    Y_ENSURE(RightOutputIUs.size() == RightFetchColumns.size());
+    const TString alias = RightOutputIUs.empty() ? TString() : RightOutputIUs[0].GetAlias();
+    const int duplicateId = Props.Metadata->ColumnLineage.AddAlias(alias, path.StringValue());
+    for (size_t i = 0; i < RightOutputIUs.size(); i++) {
+        Props.Metadata->ColumnLineage.AddMapping(RightOutputIUs[i], TColumnLineageEntry(alias, path.StringValue(), RightFetchColumns[i], duplicateId));
+    }
+}
+
+/***
  * Compute metadata for empty source
  */
 void TOpEmptySource::ComputeMetadata(TRBOContext& ctx, TPlanProps& planProps) {

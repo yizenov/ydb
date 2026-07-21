@@ -252,6 +252,47 @@ bool TAssignStagesRule::MatchAndApply(TIntrusivePtr<IOperator>& input, TRBOConte
         props.StageGraph.Connect(inputStageId, newStageId,
                                  MakeIntrusive<TStreamLookupConnection>(outputIndex, lookup->Table, columnsNode, inputTypeNode, settingsNode));
         YQL_CLOG(TRACE, CoreDq) << "Assign stages table lookup";
+    } else if (input->Kind == EOperator::LookupJoin) {
+        using namespace NYql;
+        using namespace NYql::NNodes;
+        auto lookupJoin = CastOperator<TOpLookupJoin>(input);
+        auto& exprCtx = ctx.ExprCtx;
+
+        const auto leftStageId = *(lookupJoin->GetInput()->Props.StageId);
+        const auto outputIndex = props.StageGraph.GetOutputIndex(leftStageId);
+        const auto newStageId = props.StageGraph.AddStage();
+        input->Props.StageId = newStageId;
+
+        TVector<TCoAtom> columnAtoms;
+        for (const auto& column : lookupJoin->RightFetchColumns) {
+            columnAtoms.push_back(Build<TCoAtom>(exprCtx, lookupJoin->Pos).Value(column).Done());
+        }
+        auto columnsNode = Build<TCoAtomList>(exprCtx, lookupJoin->Pos).Add(columnAtoms).Done().Ptr();
+
+        // Stream-lookup-join input item type: Tuple<leftRow, Optional<keyStruct>>. keyStruct fields are
+        // the right key columns, typed from the corresponding left key IUs.
+        const auto* leftStruct = lookupJoin->GetInput()->Type->Cast<TListExprType>()->GetItemType()->Cast<TStructExprType>();
+        TVector<const TItemExprType*> keyItems;
+        TVector<TString> leftKeyNames;
+        for (size_t i = 0; i < lookupJoin->LeftKeys.size(); i++) {
+            const auto* keyType = lookupJoin->GetInput()->GetIUType(lookupJoin->LeftKeys[i]);
+            Y_ENSURE(keyType, "Lookup-join key type is not available");
+            keyItems.push_back(exprCtx.MakeType<TItemExprType>(lookupJoin->RightKeyColumns[i], keyType));
+            leftKeyNames.push_back(lookupJoin->LeftKeys[i].GetFullName());
+        }
+        const auto* keyStruct = exprCtx.MakeType<TStructExprType>(keyItems);
+        TVector<const TTypeAnnotationNode*> tupleItems = {leftStruct, exprCtx.MakeType<TOptionalExprType>(keyStruct)};
+        const auto* listType = exprCtx.MakeType<TListExprType>(exprCtx.MakeType<TTupleExprType>(tupleItems));
+        auto inputTypeNode = ExpandType(lookupJoin->Pos, *listType, exprCtx);
+
+        TKqpStreamLookupSettings settings;
+        settings.Strategy = EStreamLookupStrategyType::LookupJoinRows;
+        auto settingsNode = settings.BuildNode(exprCtx, lookupJoin->Pos).Ptr();
+
+        props.StageGraph.Connect(leftStageId, newStageId,
+                                 MakeIntrusive<TStreamLookupJoinConnection>(outputIndex, leftKeyNames, lookupJoin->RightKeyColumns,
+                                                                            lookupJoin->Table, columnsNode, inputTypeNode, settingsNode));
+        YQL_CLOG(TRACE, CoreDq) << "Assign stages lookup join";
     } else {
         Y_ENSURE(false, "Unknown operator encountered");
     }

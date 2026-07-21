@@ -295,6 +295,18 @@ class TSelectIndexRule : public ISimplifiedRule {
 };
 
 /**
+ * Rewrite a TOpJoin the CBO marked as a lookup join into a TOpLookupJoin that absorbs the right
+ * table read (so it is realized as a stream lookup instead of an in-stage join). Runs after CBO.
+ */
+class TBuildLookupJoinRule : public ISimplifiedRule {
+  public:
+      TBuildLookupJoinRule() : ISimplifiedRule("Build lookup join", ERuleProperties::RequireParents | ERuleProperties::RequireTypes | ERuleProperties::RequireMetadata) {}
+
+      virtual bool QuickMatch(const TIntrusivePtr<IOperator>& input) const override;
+      virtual TIntrusivePtr<IOperator> SimpleMatchAndApply(const TIntrusivePtr<IOperator>& input, TRBOContext& ctx, TPlanProps& props) override;
+};
+
+/**
  * Push down filter to olap read.
  */
 class TPushOlapFilterRule : public ISimplifiedRule {

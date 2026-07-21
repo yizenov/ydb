@@ -39,6 +39,25 @@ struct TRBORelOptimizerNode : public TRelOptimizerNode {
 struct TRBOProviderContext : public TKqpProviderContext {
     TRBOProviderContext(const TKqpOptimizeContext& kqpCtx, const int optLevel, bool useBlockHashJoin) : TKqpProviderContext(kqpCtx, optLevel, useBlockHashJoin) {}
 
+    // A lookup join probes the right relation by its primary key: it is applicable when the right
+    // side's leading key column is one of the right-side join keys. This mirrors the primary-key
+    // branch of the legacy IsLookupJoinApplicableDetailed (ydb/core/kqp/opt/logical/kqp_opt_cbo.cpp),
+    // but reads the key columns from the CBO node's statistics rather than a legacy read expr, since
+    // the new RBO carries operators (not TKqlReadTable nodes) at CBO time.
+    static bool IsLookupJoinApplicable(const std::shared_ptr<IBaseOptimizerNode>& right, const TVector<TJoinColumn>& rightJoinKeys) {
+        const auto& stats = right->Stats;
+        if (!stats.KeyColumns || stats.KeyColumns->Data.empty()) {
+            return false;
+        }
+        const auto& firstKeyColumn = stats.KeyColumns->Data[0];
+        for (const auto& joinKey : rightJoinKeys) {
+            if (joinKey.AttributeName == firstKeyColumn) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     virtual bool IsJoinApplicable(
         const std::shared_ptr<IBaseOptimizerNode>& left,
         const std::shared_ptr<IBaseOptimizerNode>& right,
@@ -47,6 +66,10 @@ struct TRBOProviderContext : public TKqpProviderContext {
         NKqp::EJoinAlgoType joinAlgo,
         EJoinKind joinKind
     ) override {
+        if (joinAlgo == NKqp::EJoinAlgoType::LookupJoin) {
+            // Realized by TBuildLookupJoinRule + the LookupJoinRows stream lookup in physical conversion.
+            return IsLookupJoinApplicable(right, rightJoinKeys);
+        }
         if (joinAlgo != NKqp::EJoinAlgoType::MapJoin && joinAlgo != NKqp::EJoinAlgoType::GraceJoin) {
             return false;
         }

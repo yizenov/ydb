@@ -530,6 +530,11 @@ void TKqpNewRBOTransformer::InitializeRBOOptimizationStages() {
     selectIndexStageRules.emplace_back(std::make_unique<TSelectIndexRule>());
     RBO.AddStage(std::make_unique<TRuleBasedStage>("Select indexes", std::move(selectIndexStageRules)));
 
+    // Realize CBO-selected lookup joins as stream lookups.
+    TVector<std::unique_ptr<IRule>> lookupJoinStageRules;
+    lookupJoinStageRules.emplace_back(std::make_unique<TBuildLookupJoinRule>());
+    RBO.AddStage(std::make_unique<TRuleBasedStage>("Build lookup joins", std::move(lookupJoinStageRules)));
+
     if (inlineJoinFiltersAfterCBO) {
         TVector<std::unique_ptr<IRule>> inlineJoinFiltersAfterCBORules;
         inlineJoinFiltersAfterCBORules.emplace_back(std::make_unique<TInlineJoinFiltersRule>());

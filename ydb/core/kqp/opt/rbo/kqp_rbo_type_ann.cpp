@@ -534,6 +534,42 @@ TStatus ComputeTypes(TIntrusivePtr<TOpTableLookup> lookup, TRBOContext& ctx) {
     return TStatus::Ok;
 }
 
+TStatus ComputeTypes(TIntrusivePtr<TOpLookupJoin> lookupJoin, TRBOContext& ctx) {
+    // Output row = the left input's columns followed by the fetched right columns (renamed to the
+    // right read's output IUs), mirroring the ComputeTypes(TOpTableLookup) mapping for the right side.
+    auto leftType = lookupJoin->GetInput()->Type;
+    if (!leftType) {
+        return TStatus::Error;
+    }
+    TVector<const TItemExprType*> items = leftType->Cast<TListExprType>()->GetItemType()->Cast<TStructExprType>()->GetItems();
+
+    const auto table = ResolveTable(lookupJoin->Table.Get(), ctx.ExprCtx, ctx.KqpCtx.Cluster, *ctx.KqpCtx.Tables);
+    if (!table.second) {
+        return TStatus::Error;
+    }
+
+    TVector<TCoAtom> columns;
+    for (const auto& column : lookupJoin->RightFetchColumns) {
+        columns.push_back(Build<TCoAtom>(ctx.ExprCtx, lookupJoin->Pos).Value(column).Done());
+    }
+    const auto columnsList = Build<TCoAtomList>(ctx.ExprCtx, lookupJoin->Pos).Add(columns).Done();
+
+    const TTypeAnnotationNode* rowType = GetReadTableRowType(ctx.ExprCtx, *ctx.KqpCtx.Tables, ctx.KqpCtx.Cluster,
+        table.first, columnsList, ctx.KqpCtx.Config->SystemColumnsEnabled());
+    if (!rowType) {
+        return TStatus::Error;
+    }
+
+    for (const auto itemType : rowType->Cast<TStructExprType>()->GetItems()) {
+        const TString columnName = TString(itemType->GetName());
+        const auto it = std::find(lookupJoin->RightFetchColumns.begin(), lookupJoin->RightFetchColumns.end(), columnName);
+        const auto columnIndex = std::distance(lookupJoin->RightFetchColumns.begin(), it);
+        items.push_back(ctx.ExprCtx.MakeType<TItemExprType>(lookupJoin->RightOutputIUs[columnIndex].GetFullName(), itemType->GetItemType()));
+    }
+    lookupJoin->Type = ctx.ExprCtx.MakeType<TListExprType>(ctx.ExprCtx.MakeType<TStructExprType>(items));
+    return TStatus::Ok;
+}
+
 TStatus ComputeTypes(TIntrusivePtr<IOperator> op, TRBOContext& ctx, TPlanProps& props);
 
 TStatus ComputeTypes(TIntrusivePtr<TOpCBOTree> cboTree, TRBOContext& ctx, TPlanProps& props) {
@@ -576,6 +612,9 @@ TStatus ComputeTypes(TIntrusivePtr<IOperator> op, TRBOContext& ctx, TPlanProps& 
     }
     else if (MatchOperator<TOpTableLookup>(op)) {
         return ComputeTypes(CastOperator<TOpTableLookup>(op), ctx);
+    }
+    else if (MatchOperator<TOpLookupJoin>(op)) {
+        return ComputeTypes(CastOperator<TOpLookupJoin>(op), ctx);
     }
     else if(MatchOperator<TOpAggregate>(op)) {
         return ComputeTypes(CastOperator<TOpAggregate>(op), ctx);

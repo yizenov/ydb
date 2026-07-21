@@ -22,7 +22,7 @@ namespace NKqp {
 
 using namespace NYql;
 
-enum EOperator : ui32 { EmptySource, Source, Map, AddDependencies, Filter, Join, Aggregate, Limit, Sort, UnionAll, TableLookup, CBOTree, Root };
+enum EOperator : ui32 { EmptySource, Source, Map, AddDependencies, Filter, Join, Aggregate, Limit, Sort, UnionAll, TableLookup, LookupJoin, CBOTree, Root };
 
 // clang-format off
 #define PHASE_ENUM(X) \
@@ -754,6 +754,38 @@ public:
     TVector<TString> FetchColumns;
     TVector<TInfoUnit> OutputIUs;
     TVector<TInfoUnit> LookupKeys;
+
+protected:
+    void ComputeOutputIUs() override;
+};
+
+/***
+ * Lookup (index) join: for each row of the left input, probe the right table (Table) by key and emit
+ * the combined row. Produced after CBO for a TOpJoin whose right side is a table read that can be
+ * probed by its primary key. The left input row supplies the key values via LeftKeys, matched to the
+ * right table's key columns RightKeyColumns (positionally). RightFetchColumns are the physical right
+ * columns fetched, exposed as RightOutputIUs. Lowered to a LookupJoinRows stream lookup + a combining
+ * stage. Phase 4: inner join, base-table right side.
+ */
+class TOpLookupJoin: public IUnaryOperator {
+public:
+    TOpLookupJoin(TIntrusivePtr<IOperator> leftInput, TPositionHandle pos, const TString& joinKind, const TExprNode::TPtr& table,
+                  const TVector<TString>& rightFetchColumns, const TVector<TInfoUnit>& rightOutputIUs,
+                  const TVector<TInfoUnit>& leftKeys, const TVector<TString>& rightKeyColumns);
+
+    virtual TVector<TInfoUnit> GetUsedIUs(TPlanProps& props) override;
+    virtual void PropagateLiveness(ILivenessContext& ctx) override;
+    virtual TString ToString(TExprContext& ctx) override;
+    virtual TString GetExplainName() const override { return "LookupJoin"; }
+
+    virtual void ComputeMetadata(TRBOContext& ctx, TPlanProps& planProps) override;
+
+    TString JoinKind;
+    TExprNode::TPtr Table;
+    TVector<TString> RightFetchColumns;
+    TVector<TInfoUnit> RightOutputIUs;
+    TVector<TInfoUnit> LeftKeys;
+    TVector<TString> RightKeyColumns;
 
 protected:
     void ComputeOutputIUs() override;

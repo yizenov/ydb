@@ -27,6 +27,7 @@ SRCS(
     push_filter_into_join.cpp
     push_filter_under_map.cpp
     push_limit_into_sort.cpp
+    build_lookup_join.cpp
     kqp_rbo_index_selection.cpp
     push_ranges.cpp
     select_index.cpp
